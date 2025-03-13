@@ -236,14 +236,14 @@ PostAcceptExToIoCompletionPort(
     AcceptCtx->IoCompleted = FALSE;
 
     if (!FnAcceptEx(
-        Worker->ListenSocket,
-        AcceptCtx->Socket,
-        AcceptCtx->Buffer,
-        0,
-        sizeof(SOCKADDR_STORAGE) + 16,
-        sizeof(SOCKADDR_STORAGE) + 16,
-        &Bytes,
-        &AcceptCtx->Overlapped)) {
+            Worker->ListenSocket,
+            AcceptCtx->Socket,
+            AcceptCtx->Buffer,
+            0,
+            sizeof(SOCKADDR_STORAGE) + 16,
+            sizeof(SOCKADDR_STORAGE) + 16,
+            &Bytes,
+            &AcceptCtx->Overlapped)) {
         Status = WSAGetLastError();
         if (Status != WSA_IO_PENDING) {
             wprintf(L"AcceptEx failed with error: %u\n", WSAGetLastError());
