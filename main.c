@@ -34,6 +34,7 @@ typedef struct _GLOBAL_CONFIG {
     ULONG NumProcs;
     ULONG NumConns;
     ULONG NumAccepts;
+    ULONG DurationInSec;
     WORKER Workers[1];
 } GLOBAL_CONFIG;
 
@@ -493,7 +494,7 @@ RunClient(
         ntohs(SS_PORT(&Config->Address)));
 
     NotifyWorkers(Config, TestStart);
-    WaitForSingleObject(Config->CompletionEvent, 5000);
+    WaitForSingleObject(Config->CompletionEvent, Config->DurationInSec * 1000);
     NotifyWorkers(Config, IoLoopEnd);
 
     WaitForMultipleObjects(Config->NumProcs, ThreadArray, TRUE, INFINITE);
@@ -505,7 +506,7 @@ RunClient(
         FailedBindCount += Config->Workers[i].FailedBindCount;
     }
 
-    wprintf(L"HPS: %lld\n", ConnectedCount / 5);
+    wprintf(L"HPS: %lld\n", ConnectedCount / Config->DurationInSec);
     wprintf(L"Failed connect: %lld\n", FailedConnectCount);
     wprintf(L"Failed bind: %lld\n", FailedBindCount);
     RetValue = TRUE;
@@ -698,6 +699,13 @@ ParseCmd(
             ++Index;
             if (Index < Argc && Config->Role == RoleServer) {
                 Config->NumAccepts = _wtoi(Args[Index]);
+            } else {
+                goto Done;
+            }
+        } else if (_wcsicmp(Args[Index], L"-t") == 0) {
+            ++Index;
+            if (Index < Argc) {
+                Config->DurationInSec = _wtoi(Args[Index]);
             } else {
                 goto Done;
             }
