@@ -670,6 +670,7 @@ ParseCmd(
 
     Config->NumConns = 16;
     Config->NumAccepts = 512;
+    Config->DurationInSec = 5;
 
     while (Index < Argc) {
         if (_wcsicmp(Args[Index], L"-c") == 0 ||
@@ -727,7 +728,7 @@ PrintUsage(
     VOID
     )
 {
-    wprintf(L"Usage: tcphs <-c|-s IP> <-p port> [-o # of conns per core] [-a # pre-posted accetps]\n");
+    wprintf(L"Usage: tcphs <-c|-s IP> <-p port> [-o # of conns per core] [-a # pre-posted accetps] [-t duration (s)]\n");
 }
 
 INT
