@@ -9,6 +9,18 @@
 #include <string.h>
 #include <assert.h>
 
+#define USAGE L"Usage: iocp_test -s|-c <ip> [-p <port>] [-o <num conns>] [-a <num accepts>] [-t <duration in sec>] [-r <num procs>]\n" \
+              L"  -s: server mode\n" \
+              L"  -c: client mode\n" \
+              L"  -p: port number (default: 0)\n" \
+              L"  -o: number of connections (default: 16)\n" \
+              L"  -a: number of accepts (default: 512)\n" \
+              L"  -t: duration in seconds (default: 5)\n" \
+              L"  -r: number of threads (default: number of processors)\n"
+#define DEFAULT_NUM_CONNS 16
+#define DEFAULT_NUM_ACCEPTS 512
+#define DEFAULT_DURATION_IN_SEC 5
+
 typedef enum {
     RoleServer = L's',
     RoleClient = L'c',
@@ -707,9 +719,9 @@ ParseCmd(
     GetSystemInfo(&SystemInfo);
 
     Config->NumProcs = SystemInfo.dwNumberOfProcessors;
-    Config->NumConns = 16;
-    Config->NumAccepts = 512;
-    Config->DurationInSec = 5;
+    Config->NumConns = DEFAULT_NUM_CONNS;
+    Config->NumAccepts = DEFAULT_NUM_ACCEPTS;
+    Config->DurationInSec = DEFAULT_DURATION_IN_SEC;
 
     while (Index < Argc) {
         if (_wcsicmp(Args[Index], L"-c") == 0 ||
@@ -774,7 +786,7 @@ PrintUsage(
     VOID
     )
 {
-    wprintf(L"Usage: tcphs <-c|-s IP> <-p port> [-o # of conns per core] [-a # pre-posted accetps] [-t duration (s)]\n");
+    wprintf(USAGE);
 }
 
 INT
