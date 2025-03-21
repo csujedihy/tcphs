@@ -26,7 +26,8 @@ typedef enum {
     RoleClient = L'c',
 } Role;
 
-typedef struct _WORKER {
+DECLSPEC_ALIGN(SYSTEM_CACHE_ALIGNMENT_SIZE)
+typedef struct WORKER {
     HANDLE Iocp;
     SOCKET ListenSocket;
     volatile BOOLEAN Running;
@@ -39,7 +40,7 @@ typedef struct _WORKER {
     void* IoContexts;
 } WORKER;
 
-typedef struct _GLOBAL_CONFIG {
+typedef struct GLOBAL_CONFIG {
     Role Role;
     HANDLE CompletionEvent;
     SOCKADDR_STORAGE Address;
@@ -63,19 +64,21 @@ typedef enum {
 
 
 // Overlapped be the first member so we don't need CONTAINING_RECORD.
-typedef struct _BASE_CTX {
+typedef struct BASE_CTX {
     WSAOVERLAPPED Overlapped;
     SOCKET Socket;
     ULONG ContextIdx;
     BOOLEAN IoCompleted;
 } BASE_CTX;
 
-typedef struct _ACCEPT_CTX {
+DECLSPEC_ALIGN(SYSTEM_CACHE_ALIGNMENT_SIZE)
+typedef struct ACCEPT_CTX {
     BASE_CTX;
     char Buffer[(sizeof(SOCKADDR_STORAGE) + 16) * 2];
 } ACCEPT_CTX, * PACCEPT_CTX;
 
-typedef struct _CONNECT_CTX {
+DECLSPEC_ALIGN(SYSTEM_CACHE_ALIGNMENT_SIZE)
+typedef struct CONNECT_CTX {
     BASE_CTX;
 } CONNECT_CTX;
 
