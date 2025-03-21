@@ -9,7 +9,7 @@
 #include <string.h>
 #include <assert.h>
 
-#define USAGE L"Usage: iocp_test -s|-c <ip> [-p <port>] [-o <num conns>] [-a <num accepts>] [-t <duration in sec>] [-r <num procs>]\n" \
+#define USAGE L"Usage: tcphs -s|-c <ip> [-p <port>] [-o <num conns>] [-a <num accepts>] [-t <duration in sec>] [-r <num procs>]\n" \
               L"  -s: server mode\n" \
               L"  -c: client mode\n" \
               L"  -p: port number (default: 0)\n" \
@@ -27,7 +27,6 @@ typedef enum {
 } Role;
 
 typedef struct _WORKER {
-    ULONG Idx;
     HANDLE Iocp;
     SOCKET ListenSocket;
     volatile BOOLEAN Running;
@@ -62,9 +61,8 @@ typedef enum {
     IoLoopEnd,
 } CompletionKey;
 
-//
+
 // Overlapped be the first member so we don't need CONTAINING_RECORD.
-//
 typedef struct _BASE_CTX {
     WSAOVERLAPPED Overlapped;
     SOCKET Socket;
@@ -512,22 +510,28 @@ RunClient(
         }
     }
 
-    for (ULONG i = 0; i < Config->NumProcs; ++i) {
-        WORKER* Worker = &Config->Workers[i];
-        ThreadArray[i] =
-            CreateThread(NULL, 0, IocpLoop, Worker, 0, NULL);
+    ULONG ThreadIdx;
+    for (ThreadIdx = 0; ThreadIdx < Config->NumProcs; ++ThreadIdx) {
+        WORKER* Worker = &Config->Workers[ThreadIdx];
+        ThreadArray[ThreadIdx] = CreateThread(NULL, 0, IocpLoop, Worker, 0, NULL);
+        if (ThreadArray[ThreadIdx] == NULL) {
+            wprintf(L"CreateThread failed with %d\n", GetLastError());
+            break;
+        }
     }
 
-    wprintf(
-        L"Connecting to %s:%d\n",
-        GetIpStringFromAddress(
-            &Config->Address,
-            AddressBuffer,
-            sizeof(AddressBuffer)),
-        ntohs(SS_PORT(&Config->Address)));
+    if (ThreadIdx == Config->NumProcs) {
+        wprintf(
+            L"Connecting to %s:%d\n",
+            GetIpStringFromAddress(
+                &Config->Address,
+                AddressBuffer,
+                sizeof(AddressBuffer)),
+            ntohs(SS_PORT(&Config->Address)));
 
-    NotifyWorkers(Config, TestStart);
-    WaitForSingleObject(Config->CompletionEvent, Config->DurationInSec * 1000);
+        NotifyWorkers(Config, TestStart);
+        WaitForSingleObject(Config->CompletionEvent, Config->DurationInSec * 1000);
+    }
     NotifyWorkers(Config, IoLoopEnd);
 
     WaitForMultipleObjects(Config->NumProcs, ThreadArray, TRUE, INFINITE);
@@ -639,15 +643,19 @@ RunServer(
         goto Failed;
     }
 
-
-    for (ULONG i = 0; i < Config->NumProcs; ++i) {
-        WORKER* Worker = &Config->Workers[i];
+    ULONG ThreadIdx;
+    for (ThreadIdx = 0; ThreadIdx < Config->NumProcs; ++ThreadIdx) {
+        WORKER* Worker = &Config->Workers[ThreadIdx];
         InterlockedIncrement(&Config->AcceptWorkerRef);
-        ThreadArray[i] = CreateThread(NULL, 0, IocpLoop, Worker, 0, NULL);
+        ThreadArray[ThreadIdx] = CreateThread(NULL, 0, IocpLoop, Worker, 0, NULL);
+        if (ThreadArray[ThreadIdx] == NULL) {
+            wprintf(L"CreateThread failed with %d\n", GetLastError());
+            break;
+        }
     }
 
-    NotifyWorkers(Config, TestStart);
-    WaitForMultipleObjects(Config->NumProcs, ThreadArray, TRUE, INFINITE);
+    NotifyWorkers(Config, ThreadIdx == Config->NumProcs ? TestStart : IoLoopEnd);
+    WaitForMultipleObjects(ThreadIdx, ThreadArray, TRUE, INFINITE);
 
 Failed:
 
