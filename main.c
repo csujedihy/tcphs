@@ -15,6 +15,7 @@ typedef enum {
 } Role;
 
 typedef struct _WORKER {
+    ULONG Idx;
     HANDLE Iocp;
     SOCKET ListenSocket;
     volatile BOOLEAN Running;
@@ -31,6 +32,8 @@ typedef struct _GLOBAL_CONFIG {
     Role Role;
     HANDLE CompletionEvent;
     SOCKADDR_STORAGE Address;
+    LONG AcceptIOStarted;
+    LONG AcceptWorkerRef;
     ULONG NumProcs;
     ULONG NumConns;
     ULONG NumAccepts;
@@ -77,7 +80,7 @@ NotifyWorkers(
     CompletionKey Cmd
     )
 {
-    for (DWORD i = 0; i < Config->NumProcs; ++i) {
+    for (ULONG i = 0; i < (Config->Role == RoleServer ? 1 : Config->NumProcs); ++i) {
         PostQueuedCompletionStatus(Config->Workers[i].Iocp, 0, Cmd, NULL);
     }
 }
@@ -282,6 +285,7 @@ IocpLoop(
     ACCEPT_CTX* AcceptCtx;
     ULONG Status;
     DWORD ThreadId = GetCurrentThreadId();
+    BOOLEAN ShouldCleanUpServer = FALSE;
 
     wprintf(L"(%d) Entering IOCP loop...\n", ThreadId);
 
@@ -339,6 +343,14 @@ IocpLoop(
                 PostConnectExToIoCompletionPort(Worker, ConnectCtx->ContextIdx);
             } else if (IocpCompletionKey == (PULONG_PTR)IoLoopEnd) {
                 Worker->Running = FALSE;
+                if (GlobalConfig->Role == RoleServer) {
+                    // For server, we need to flood the exiting signal to all threads.
+                    if (InterlockedDecrement(&GlobalConfig->AcceptWorkerRef) == 0) {
+                        ShouldCleanUpServer = TRUE;
+                    } else {
+                        NotifyWorkers(GlobalConfig, IoLoopEnd);
+                    }
+                }
             } else if (IocpCompletionKey == (PULONG_PTR)TestStart) {
                 //
                 // Kick off testing.
@@ -347,9 +359,14 @@ IocpLoop(
                     for (ULONG i = 0; i < GlobalConfig->NumConns; ++i) {
                         PostConnectExToIoCompletionPort(Worker, i);
                     }
-                } else { // RoleServer
-                    for (ULONG i = 0; i < GlobalConfig->NumAccepts; ++i) {
-                        PostAcceptExToIoCompletionPort(Worker, i);
+                } else {
+                    // RoleServer
+                    // Note: in server role, all threads share the same IOCP handle. So, ensure
+                    // that only one thread kicks off the acceptex IOs.
+                    if (InterlockedExchange(&GlobalConfig->AcceptIOStarted, 1) == 0) {
+                        for (ULONG i = 0; i < GlobalConfig->NumAccepts; ++i) {
+                            PostAcceptExToIoCompletionPort(Worker, i);
+                        }
                     }
                 }
             } else {
@@ -359,7 +376,6 @@ IocpLoop(
         }
     }
 
-    wprintf(L"(%d) Draining %llu pending IOs on\n", ThreadId, Worker->PendingIoCount);
     ULONG PendingIoCount = 0;
     if (GlobalConfig->Role == RoleClient) {
         for (ULONG i = 0; i < GlobalConfig->NumConns; ++i) {
@@ -369,7 +385,8 @@ IocpLoop(
                 closesocket(ConnectCtx->Socket);
             }
         }
-    } else {
+    } else if (ShouldCleanUpServer) { // RoleServer
+        // For server, last thread to exit will clean up all pending IOs.
         for (ULONG i = 0; i < GlobalConfig->NumAccepts; ++i) {
             ACCEPT_CTX* AcceptCtx = &((ACCEPT_CTX*)Worker->IoContexts)[i];
             if (AcceptCtx->IoCompleted == FALSE) {
@@ -379,7 +396,11 @@ IocpLoop(
         }
     }
 
-    assert(PendingIoCount == Worker->PendingIoCount);
+    wprintf(
+        L"(%d) stats: %lu pending %llu completed\n",
+        ThreadId,
+        PendingIoCount,
+        GlobalConfig->Role == RoleServer ? Worker->AcceptedCount : Worker->ConnectedCount);
 
     while (PendingIoCount > 0) {
         Success =
@@ -544,50 +565,60 @@ RunServer(
     PHANDLE ThreadArray = NULL;
     INT Status = 0;
     BOOLEAN RetValue = FALSE;
+    SOCKET ListenSocket = INVALID_SOCKET;
+    HANDLE Iocp = NULL;
 
-    assert(Config->NumProcs == 1); // Server only supports 1 processor.
+    ListenSocket = socket(Config->Address.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    if (ListenSocket == INVALID_SOCKET) {
+        wprintf(L"socket failed with %d\n", WSAGetLastError());
+        goto Failed;
+    }
+
+    Status = bind(ListenSocket, (PSOCKADDR)&Config->Address, sizeof(Config->Address));
+    if (Status == SOCKET_ERROR) {
+        wprintf(L"bind failed with %d\n", WSAGetLastError());
+        goto Failed;
+    }
+
+    Status = listen(ListenSocket, SOMAXCONN);
+    if (Status == SOCKET_ERROR) {
+        wprintf(L"listen failed with %d\n", WSAGetLastError());
+    }
+
+    Iocp =
+        CreateIoCompletionPort(
+            (HANDLE)ListenSocket,
+            NULL,
+            (ULONG_PTR)ServerCompletionKey,
+            0);
+    if (Iocp == NULL) {
+        wprintf(
+            L"CreateIoCompletionPort failed with error: %u\n",
+            GetLastError());
+        goto Failed;
+    }
+
+    wprintf(
+        L"Listening on %s:%d\n",
+        GetIpStringFromAddress(
+            &Config->Address,
+            AddressBuffer,
+            sizeof(AddressBuffer)),
+        ntohs(SS_PORT(&Config->Address)));
+
+    // All workers share the same IO context array.
+    void* IoContexts = calloc(Config->NumAccepts, sizeof(ACCEPT_CTX));
+    if (IoContexts == NULL) {
+        wprintf(L"Failed to allocate IoContexts array\n");
+        goto Failed;
+    }
 
     for (ULONG i = 0; i < Config->NumProcs; ++i) {
         WORKER* Worker = &Config->Workers[i];
         Worker->Running = TRUE;
-        Worker->ListenSocket = socket(Config->Address.ss_family, SOCK_STREAM, IPPROTO_TCP);
-
-        Worker->IoContexts = calloc(Config->NumAccepts, sizeof(ACCEPT_CTX));
-        if (Worker->IoContexts == NULL) {
-            wprintf(L"Failed to allocate IoContexts array\n");
-            goto Failed;
-        }
-        Status = bind(Worker->ListenSocket, (PSOCKADDR)&Config->Address, sizeof(Config->Address));
-        if (Status == SOCKET_ERROR) {
-            wprintf(L"bind failed with %d\n", WSAGetLastError());
-            goto Failed;
-        }
-
-        Status = listen(Worker->ListenSocket, SOMAXCONN);
-        if (Status == SOCKET_ERROR) {
-            wprintf(L"listen failed with %d\n", WSAGetLastError());
-        }
-
-        wprintf(
-            L"Listening on %s:%d\n",
-            GetIpStringFromAddress(
-                &Config->Address,
-                AddressBuffer,
-                sizeof(AddressBuffer)),
-            ntohs(SS_PORT(&Config->Address)));
-
-        Worker->Iocp =
-            CreateIoCompletionPort(
-                (HANDLE)Worker->ListenSocket,
-                NULL,
-                (ULONG_PTR)ServerCompletionKey,
-                0);
-        if (Worker->Iocp == NULL) {
-            wprintf(
-                L"CreateIoCompletionPort failed with error: %u\n",
-                GetLastError());
-            goto Failed;
-        }
+        Worker->ListenSocket = ListenSocket;
+        Worker->Iocp = Iocp;
+        Worker->IoContexts = IoContexts;
     }
 
     ThreadArray = (PHANDLE)calloc(1, sizeof(HANDLE) * Config->NumProcs);
@@ -599,6 +630,7 @@ RunServer(
 
     for (ULONG i = 0; i < Config->NumProcs; ++i) {
         WORKER* Worker = &Config->Workers[i];
+        InterlockedIncrement(&Config->AcceptWorkerRef);
         ThreadArray[i] = CreateThread(NULL, 0, IocpLoop, Worker, 0, NULL);
     }
 
@@ -609,15 +641,18 @@ Failed:
 
     for (ULONG i = 0; i < Config->NumProcs; ++i) {
         WORKER* Worker = &Config->Workers[i];
-        if (Worker->ListenSocket != INVALID_SOCKET) {
-            closesocket(Worker->ListenSocket);
-        }
-        if (Worker->Iocp != NULL) {
-            CloseHandle(Worker->Iocp);
-        }
-        if (Worker->IoContexts) {
+        if (Worker->IoContexts && i == 0) {
             free(Worker->IoContexts);
         }
+    }
+
+    // TODO: Close the listen socket before shutting down the iocp loop?
+    if (ListenSocket != INVALID_SOCKET) {
+        closesocket(ListenSocket);
+    }
+
+    if (Iocp != NULL) {
+        CloseHandle(Iocp);
     }
 
     if (ThreadArray != NULL) {
@@ -663,11 +698,15 @@ ParseCmd(
 {
     BOOLEAN Status = FALSE;
     LONG Index = 1;
+    SYSTEM_INFO SystemInfo;
 
     if (Argc < 2) {
         return FALSE;
     }
 
+    GetSystemInfo(&SystemInfo);
+
+    Config->NumProcs = SystemInfo.dwNumberOfProcessors;
     Config->NumConns = 16;
     Config->NumAccepts = 512;
     Config->DurationInSec = 5;
@@ -710,6 +749,13 @@ ParseCmd(
             } else {
                 goto Done;
             }
+        }  else if (_wcsicmp(Args[Index], L"-r") == 0) {
+            ++Index;
+            if (Index < Argc) {
+                Config->NumProcs = _wtoi(Args[Index]);
+            } else {
+                goto Done;
+            }
         } else {
             goto Done;
         }
@@ -739,29 +785,28 @@ wmain(
     )
 {
     WSADATA WsaData;
-    SYSTEM_INFO SystemInfo;
-    INT Status = 1;
+    INT Status = -1;
     DWORD Bytes;
     SOCKET Socket;
+    GLOBAL_CONFIG TempConfig = {0};
 
     WSAStartup(MAKEWORD(2, 2), &WsaData);
 
-    GetSystemInfo(&SystemInfo);
+    if (!ParseCmd(Argc, Args, &TempConfig)) {
+        PrintUsage();
+        goto Done;
+    }
+
     GlobalConfig =
         calloc(
             1,
-            sizeof(GLOBAL_CONFIG) + sizeof(WORKER) * (SystemInfo.dwNumberOfProcessors - 1));
+            sizeof(GLOBAL_CONFIG) + sizeof(WORKER) * (TempConfig.NumProcs - 1));
     if (GlobalConfig == NULL) {
         wprintf(L"Failed to allocate memory for GlobalConfig\n");
         goto Done;
     }
 
-    if (!ParseCmd(Argc, Args, GlobalConfig)) {
-        PrintUsage();
-        goto Done;
-    }
-
-    GlobalConfig->NumProcs = GlobalConfig->Role == RoleClient ? SystemInfo.dwNumberOfProcessors : 1;
+    *GlobalConfig = TempConfig;
 
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
@@ -814,5 +859,6 @@ wmain(
 Done:
     SetConsoleCtrlHandler(CtrlHandler, FALSE);
     WSACleanup();
+    wprintf(L"Done...\n");
     return Status;
 }
