@@ -365,9 +365,7 @@ IocpLoop(
                     }
                 }
             } else if (IocpCompletionKey == (PULONG_PTR)TestStart) {
-                //
                 // Kick off testing.
-                //
                 if (GlobalConfig->Role == RoleClient) {
                     for (ULONG i = 0; i < GlobalConfig->NumConns; ++i) {
                         PostConnectExToIoCompletionPort(Worker, i);
@@ -496,9 +494,7 @@ RunClient(
             goto Failed;
         }
 
-        //
         // Create an IOCP for the worker.
-        //
         Worker->Iocp =
             CreateIoCompletionPort(
                 INVALID_HANDLE_VALUE,
