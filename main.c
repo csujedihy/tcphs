@@ -1,3 +1,23 @@
+/*
+
+tcphs - TCP handshake benchmark
+
+IO model:
+
+For client:
+We have multiple (by default, the # of CPU cores) workers each running on a separate thread.
+Each worker repeats connecting to the server and disconnecting forcibly (avoid timewaits)
+after the connection is established. Each worker can have a constant number of pending connects.
+
+Each worker is assigned a IOCP handle and all connect IOs that are initiated by the worker are associated
+with the IOCP handle.
+
+For server:
+The only difference is all workers share the same IOCP handle and the acceptex IOs are initiated by only one
+worker. The other workers are used to process the accept IO completions.
+
+*/
+
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
