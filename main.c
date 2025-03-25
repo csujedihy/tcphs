@@ -553,7 +553,7 @@ RunClient(
     }
     NotifyWorkers(Config, IoLoopEnd);
 
-    WaitForMultipleObjects(Config->NumProcs, ThreadArray, TRUE, INFINITE);
+    WaitForMultipleObjects(ThreadIdx, ThreadArray, TRUE, INFINITE);
 
     for (ULONG i = 0; i < Config->NumProcs; ++i) {
         ConnectedCount += Config->Workers[i].ConnectedCount;
