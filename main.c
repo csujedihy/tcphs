@@ -5,12 +5,12 @@ tcphs - TCP handshake benchmark
 IO model:
 
 For client:
-We have multiple (by default, the # of CPU cores) workers each running on a separate thread.
+The client spins up multiple (by default, the # of CPU cores) workers each running on a separate thread.
 Each worker repeats connecting to the server and disconnecting forcibly (avoid timewaits)
-after the connection is established. Each worker can have a constant number of pending connects.
+right after the connection is established. Each worker can have a constant number of pending connects.
 
-Each worker is assigned a IOCP handle and all connect IOs that are initiated by the worker are associated
-with the IOCP handle.
+Each worker is assigned a IOCP handle and all connect IOs that are initiated by same worker are associated
+with the same IOCP handle.
 
 For server:
 The only difference is all workers share the same IOCP handle and the acceptex IOs are initiated by only one
@@ -141,7 +141,7 @@ CtrlHandler(
 }
 
 BOOLEAN
-PostConnectExToIoCompletionPort(
+PostConnectExIoToWorker(
     WORKER* Worker,
     ULONG Idx
     )
@@ -232,7 +232,7 @@ Failed:
 }
 
 BOOLEAN
-PostAcceptExToIoCompletionPort(
+PostAcceptExIoToWorker(
     WORKER* Worker,
     ULONG Idx
     )
@@ -349,13 +349,13 @@ IocpLoop(
                         SO_UPDATE_ACCEPT_CONTEXT,
                         (PCHAR)&Worker->ListenSocket,
                         sizeof(Worker->ListenSocket));
-                    closesocket(AcceptCtx->Socket);
                 } else {
                     ++Worker->FailedAcceptCount;
                 }
+                closesocket(AcceptCtx->Socket);
                 --Worker->PendingIoCount;
                 AcceptCtx->IoCompleted = TRUE;
-                PostAcceptExToIoCompletionPort(Worker, AcceptCtx->ContextIdx);
+                PostAcceptExIoToWorker(Worker, AcceptCtx->ContextIdx);
             } else if (IocpCompletionKey == (PULONG_PTR)ClientCompletionKey) {
                 ConnectCtx = (CONNECT_CTX*)IocpOverlapped;
                 if (Success) {
@@ -366,14 +366,13 @@ IocpLoop(
                         SO_UPDATE_CONNECT_CONTEXT,
                         NULL,
                         0);
-                    closesocket(ConnectCtx->Socket);
                 } else {
                     ++Worker->FailedConnectCount;
-                    closesocket(ConnectCtx->Socket);
                 }
+                closesocket(ConnectCtx->Socket);
                 --Worker->PendingIoCount;
                 ConnectCtx->IoCompleted = TRUE;
-                PostConnectExToIoCompletionPort(Worker, ConnectCtx->ContextIdx);
+                PostConnectExIoToWorker(Worker, ConnectCtx->ContextIdx);
             } else if (IocpCompletionKey == (PULONG_PTR)IoLoopEnd) {
                 Worker->Running = FALSE;
                 if (GlobalConfig->Role == RoleServer) {
@@ -388,7 +387,7 @@ IocpLoop(
                 // Kick off testing.
                 if (GlobalConfig->Role == RoleClient) {
                     for (ULONG i = 0; i < GlobalConfig->NumConns; ++i) {
-                        PostConnectExToIoCompletionPort(Worker, i);
+                        PostConnectExIoToWorker(Worker, i);
                     }
                 } else {
                     // RoleServer
@@ -396,7 +395,7 @@ IocpLoop(
                     // that only one thread kicks off the acceptex IOs.
                     if (InterlockedExchange(&GlobalConfig->AcceptIOStarted, 1) == 0) {
                         for (ULONG i = 0; i < GlobalConfig->NumAccepts; ++i) {
-                            PostAcceptExToIoCompletionPort(Worker, i);
+                            PostAcceptExIoToWorker(Worker, i);
                         }
                     }
                 }
