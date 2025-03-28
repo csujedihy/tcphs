@@ -40,6 +40,8 @@ worker. The other workers are used to process the accept IO completions.
 #define DEFAULT_NUM_CONNS 16
 #define DEFAULT_NUM_ACCEPTS 512
 #define DEFAULT_DURATION_IN_SEC 5
+#define HISTO_SIZE 512
+#define HISTO_GRANULARITY_US 100
 
 typedef enum {
     RoleServer = L's',
@@ -58,6 +60,8 @@ typedef struct WORKER {
     volatile LONG64 FailedBindCount;
     volatile LONG64 PendingIoCount;
     void* IoContexts;
+    ULONG Histo[HISTO_SIZE];
+    USHORT HistoIdx;
 } WORKER;
 
 typedef struct GLOBAL_CONFIG {
@@ -65,6 +69,7 @@ typedef struct GLOBAL_CONFIG {
     HANDLE TerminationEvent;
     SOCKADDR_STORAGE Address;
     BOOLEAN RandomizedPorts;
+    BOOLEAN LatencyHistogram;
     LONG AcceptIOStarted;
     LONG AcceptWorkerRef;
     ULONG NumProcs;
@@ -102,12 +107,30 @@ typedef struct ACCEPT_CTX {
 DECLSPEC_ALIGN(SYSTEM_CACHE_ALIGNMENT_SIZE)
 typedef struct CONNECT_CTX {
     BASE_CTX;
+    ULONG StartTimeInUs;
 } CONNECT_CTX;
 
 LPFN_ACCEPTEX FnAcceptEx = NULL;
 GUID GuidAcceptEx = WSAID_ACCEPTEX;
 LPFN_CONNECTEX FnConnectEx = NULL;
 GUID GuidConnectEx = WSAID_CONNECTEX;
+LARGE_INTEGER QPCFreq;
+
+inline
+ULONG
+GetUsTicks(
+    void
+    )
+{
+    LARGE_INTEGER QPC;
+    QueryPerformanceCounter(&QPC);
+    ULONG64 High = (QPC.QuadPart >> 32) * 1000000;
+    ULONG64 Low = (QPC.QuadPart & 0xFFFFFFFF) * 1000000;
+    QPC.QuadPart =
+        ((High / QPCFreq.QuadPart) << 32) +
+        ((Low + ((High % QPCFreq.QuadPart) << 32)) / QPCFreq.QuadPart);
+    return QPC.LowPart;
+}
 
 VOID
 NotifyWorkers(
@@ -220,13 +243,13 @@ PostConnectExIoToWorker(
         (ULONG_PTR)ClientCompletionKey, 0);
 
     if (!FnConnectEx(
-        ConnectCtx->Socket,
-        (PSOCKADDR)&GlobalConfig->Address,
-        sizeof(GlobalConfig->Address),
-        NULL,
-        0,
-        NULL,
-        &ConnectCtx->Overlapped)) {
+            ConnectCtx->Socket,
+            (PSOCKADDR)&GlobalConfig->Address,
+            sizeof(GlobalConfig->Address),
+            NULL,
+            0,
+            NULL,
+            &ConnectCtx->Overlapped)) {
         Status = WSAGetLastError();
         if (Status != WSA_IO_PENDING) {
             wprintf(L"ConnectEx failed with error: %u\n", WSAGetLastError());
@@ -234,6 +257,7 @@ PostConnectExIoToWorker(
         }
     }
 
+    ConnectCtx->StartTimeInUs = GetUsTicks();
     ConnectCtx->IoCompleted = FALSE;
     ConnectCtx->ContextIdx = Idx;
     Worker->PendingIoCount++;
@@ -353,6 +377,7 @@ IocpLoop(
         if (Success == FALSE) {
             wprintf(L"GetQueuedCompletionStatusEx failed: 0x%x\n", Status);
         }
+        ULONG Now = GetUsTicks();
         for (ULONG OvId = 0; OvId < Count; ++OvId) {
             IocpOverlapped = IoCompletions[OvId].lpOverlapped;
             IocpCompletionKey = (PVOID)IoCompletions[OvId].lpCompletionKey;
@@ -380,6 +405,8 @@ IocpLoop(
                 ConnectCtx = (CONNECT_CTX*)IocpOverlapped;
 
                 if (Success) {
+                    ULONG LatencyIdx = (Now - ConnectCtx->StartTimeInUs) / HISTO_GRANULARITY_US;
+                    Worker->Histo[LatencyIdx < HISTO_SIZE ? LatencyIdx : HISTO_SIZE - 1]++;
                     ++Worker->ConnectedCount;
                     setsockopt(
                         ConnectCtx->Socket,
@@ -581,6 +608,52 @@ RunClient(
     wprintf(L"HPS: %lld\n", ConnectedCount / Config->DurationInSec);
     wprintf(L"Failed connect: %lld\n", FailedConnectCount);
     wprintf(L"Failed bind: %lld\n", FailedBindCount);
+
+    if (Config->LatencyHistogram) {
+        wprintf(L"\nLatency Histogram\n");
+        wprintf(L"-------------+-----------+-------------------\n");
+
+        // Find maximum count for scaling
+        ULONG MaxCount = 0;
+        for (ULONG i = 0; i < HISTO_SIZE; ++i) {
+            // Accumulate histogram from all threads into first worker
+            for (ULONG j = 1; j < Config->NumProcs; ++j) {
+                Config->Workers[0].Histo[i] += Config->Workers[j].Histo[i];
+            }
+            if (Config->Workers[0].Histo[i] > MaxCount) {
+                MaxCount = Config->Workers[0].Histo[i];
+            }
+        }
+
+        // Print header
+        wprintf(L"Latency (us) |   Count   | Distribution\n");
+        wprintf(L"-------------+-----------+-------------------\n");
+
+        // Print histogram with bars (scaled to 50 characters max width)
+        const ULONG MaxBarWidth = 50;
+        for (ULONG i = 0; i < HISTO_SIZE; ++i) {
+            ULONG Count = Config->Workers[0].Histo[i];
+            if (Count > 0 || i == HISTO_SIZE - 1) {  // Only print non-zero buckets + last bucket
+                ULONG BarWidth = MaxCount > 0 ? (Count * MaxBarWidth) / MaxCount : 0;
+
+                // Print latency range
+                if (i == HISTO_SIZE - 1) {
+                    wprintf(L"%5lu+      ", i * HISTO_GRANULARITY_US);
+                } else {
+                    wprintf(L"%5lu-%-5lu ", i * HISTO_GRANULARITY_US, (i + 1) * HISTO_GRANULARITY_US - 1);
+                }
+
+                // Print count
+                wprintf(L" | %9u | ", Count);
+                // Print bar
+                for (ULONG j = 0; j < BarWidth; j++) {
+                    wprintf(L"#");
+                }
+                wprintf(L"\n");
+            }
+        }
+    }
+
     RetValue = TRUE;
 
 Failed:
@@ -813,6 +886,8 @@ ParseCmd(
             }
         }  else if (_wcsicmp(Args[Index], L"-m") == 0) {
             Config->RandomizedPorts = TRUE;
+        } else if (_wcsicmp(Args[Index], L"-h") == 0) {
+            Config->LatencyHistogram = TRUE;
         } else {
             goto Done;
         }
@@ -864,6 +939,11 @@ wmain(
     }
 
     *GlobalConfig = TempConfig;
+
+    if (!QueryPerformanceFrequency(&QPCFreq)) {
+        wprintf(L"QueryPerformanceFrequency failed with %d\n", GetLastError());
+        goto Done;
+    }
 
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
