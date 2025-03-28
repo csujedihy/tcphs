@@ -62,8 +62,9 @@ typedef struct WORKER {
 
 typedef struct GLOBAL_CONFIG {
     Role Role;
-    HANDLE CompletionEvent;
+    HANDLE TerminationEvent;
     SOCKADDR_STORAGE Address;
+    BOOLEAN RandomizedPorts;
     LONG AcceptIOStarted;
     LONG AcceptWorkerRef;
     ULONG NumProcs;
@@ -76,12 +77,13 @@ typedef struct GLOBAL_CONFIG {
 GLOBAL_CONFIG* GlobalConfig;
 
 typedef enum {
-    ServerCompletionKey,
+    ServerCompletionKey = 0,
     ClientCompletionKey,
     TestStart,
     IoLoopEnd,
 } CompletionKey;
 
+static_assert(ClientCompletionKey > ServerCompletionKey, "ClientCompletionKey must be greater than ServerCompletionKey");
 
 // Overlapped be the first member so we don't need CONTAINING_RECORD.
 typedef struct BASE_CTX {
@@ -95,7 +97,7 @@ DECLSPEC_ALIGN(SYSTEM_CACHE_ALIGNMENT_SIZE)
 typedef struct ACCEPT_CTX {
     BASE_CTX;
     char Buffer[(sizeof(SOCKADDR_STORAGE) + 16) * 2];
-} ACCEPT_CTX, * PACCEPT_CTX;
+} ACCEPT_CTX;
 
 DECLSPEC_ALIGN(SYSTEM_CACHE_ALIGNMENT_SIZE)
 typedef struct CONNECT_CTX {
@@ -132,6 +134,7 @@ CtrlHandler(
     case CTRL_CLOSE_EVENT:
         wprintf(L"Exiting IOCP loop...\n");
         NotifyWorkers(GlobalConfig, IoLoopEnd);
+        SetEvent(GlobalConfig->TerminationEvent);
         break;
     default:
         return FALSE;
@@ -176,6 +179,21 @@ PostConnectExIoToWorker(
     if (Status == SOCKET_ERROR) {
         Worker->FailedConnectCount++;
         goto Failed;
+    }
+
+    if (GlobalConfig->RandomizedPorts) {
+        DWORD Opt = 1;
+        Status =
+            setsockopt(
+                ConnectCtx->Socket,
+                SOL_SOCKET,
+                SO_RANDOMIZE_PORT,
+                (char*)&Opt,
+                sizeof(Opt));
+        if (Status == SOCKET_ERROR) {
+            Worker->FailedConnectCount++;
+            goto Failed;
+        }
     }
 
     if (GlobalConfig->Address.ss_family == AF_INET) {
@@ -237,7 +255,7 @@ PostAcceptExIoToWorker(
     ULONG Idx
     )
 {
-    PACCEPT_CTX AcceptCtx = &((PACCEPT_CTX)Worker->IoContexts)[Idx];
+    ACCEPT_CTX* AcceptCtx = &((ACCEPT_CTX*)Worker->IoContexts)[Idx];
     INT Status = 0;
     DWORD Bytes;
     LINGER Linger;
@@ -311,7 +329,7 @@ IocpLoop(
     WORKER* Worker = (WORKER*)Context;
     ULONG Count;
     PVOID IocpCompletionKey = NULL;
-    OVERLAPPED_ENTRY IoCompletions[32];
+    OVERLAPPED_ENTRY IoCompletions[64];
     WSAOVERLAPPED* IocpOverlapped;
     BOOL Success;
     CONNECT_CTX* ConnectCtx;
@@ -340,7 +358,8 @@ IocpLoop(
             IocpCompletionKey = (PVOID)IoCompletions[OvId].lpCompletionKey;
             Success = (IoCompletions[OvId].Internal == 0) ? TRUE : FALSE;
             if (IocpCompletionKey == (PULONG_PTR)ServerCompletionKey) {
-                AcceptCtx = (PACCEPT_CTX)IocpOverlapped;
+                AcceptCtx = (ACCEPT_CTX*)IocpOverlapped;
+
                 if (Success) {
                     ++Worker->AcceptedCount;
                     setsockopt(
@@ -355,9 +374,11 @@ IocpLoop(
                 closesocket(AcceptCtx->Socket);
                 --Worker->PendingIoCount;
                 AcceptCtx->IoCompleted = TRUE;
+
                 PostAcceptExIoToWorker(Worker, AcceptCtx->ContextIdx);
             } else if (IocpCompletionKey == (PULONG_PTR)ClientCompletionKey) {
                 ConnectCtx = (CONNECT_CTX*)IocpOverlapped;
+
                 if (Success) {
                     ++Worker->ConnectedCount;
                     setsockopt(
@@ -372,6 +393,7 @@ IocpLoop(
                 closesocket(ConnectCtx->Socket);
                 --Worker->PendingIoCount;
                 ConnectCtx->IoCompleted = TRUE;
+
                 PostConnectExIoToWorker(Worker, ConnectCtx->ContextIdx);
             } else if (IocpCompletionKey == (PULONG_PTR)IoLoopEnd) {
                 Worker->Running = FALSE;
@@ -400,8 +422,7 @@ IocpLoop(
                     }
                 }
             } else {
-                Worker->Running = FALSE;
-                wprintf(L"Unexpected socket notification\n");
+                assert(FALSE);
             }
         }
     }
@@ -445,13 +466,9 @@ IocpLoop(
             IocpOverlapped = IoCompletions[OvId].lpOverlapped;
             IocpCompletionKey = (PVOID)IoCompletions[OvId].lpCompletionKey;
             Success = (IoCompletions[OvId].Internal == 0) ? TRUE : FALSE;
-            if (IocpCompletionKey == (PULONG_PTR)ServerCompletionKey) {
-                AcceptCtx = (PACCEPT_CTX)IocpOverlapped;
-                AcceptCtx->IoCompleted = TRUE;
-                --PendingIoCount;
-            } else if (IocpCompletionKey == (PULONG_PTR)ClientCompletionKey) {
-                ConnectCtx = (CONNECT_CTX*)IocpOverlapped;
-                ConnectCtx->IoCompleted = TRUE;
+            if ((PULONG_PTR)IocpCompletionKey <= (PULONG_PTR)ClientCompletionKey) {
+                BASE_CTX* Ctx = (BASE_CTX*)IocpOverlapped;
+                Ctx->IoCompleted = TRUE;
                 --PendingIoCount;
             }
         }
@@ -548,7 +565,7 @@ RunClient(
             ntohs(SS_PORT(&Config->Address)));
 
         NotifyWorkers(Config, TestStart);
-        WaitForSingleObject(Config->CompletionEvent, Config->DurationInSec * 1000);
+        WaitForSingleObject(Config->TerminationEvent, Config->DurationInSec * 1000);
     }
     NotifyWorkers(Config, IoLoopEnd);
 
@@ -794,6 +811,8 @@ ParseCmd(
             } else {
                 goto Done;
             }
+        }  else if (_wcsicmp(Args[Index], L"-m") == 0) {
+            Config->RandomizedPorts = TRUE;
         } else {
             goto Done;
         }
@@ -873,8 +892,8 @@ wmain(
         goto Done;
     }
 
-    GlobalConfig->CompletionEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if (GlobalConfig->CompletionEvent == NULL) {
+    GlobalConfig->TerminationEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (GlobalConfig->TerminationEvent == NULL) {
         wprintf(L"CreateEvent failed with error: %u\n", GetLastError());
         goto Done;
     }
