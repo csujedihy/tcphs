@@ -282,9 +282,6 @@ PostAcceptExIoToWorker(
     ACCEPT_CTX* AcceptCtx = &((ACCEPT_CTX*)Worker->IoContexts)[Idx];
     INT Status = 0;
     DWORD Bytes;
-    LINGER Linger;
-    Linger.l_onoff = 1;
-    Linger.l_linger = 0;
 
     memset(&AcceptCtx->Overlapped, 0, sizeof(AcceptCtx->Overlapped));
     AcceptCtx->Socket =
@@ -296,17 +293,6 @@ PostAcceptExIoToWorker(
             0,
             WSA_FLAG_OVERLAPPED);
     if (AcceptCtx->Socket == INVALID_SOCKET) {
-        goto Failed;
-    }
-
-    Status =
-        setsockopt(
-            AcceptCtx->Socket,
-            SOL_SOCKET,
-            SO_LINGER,
-            (char*)&Linger,
-            sizeof(Linger));
-    if (Status == SOCKET_ERROR) {
         goto Failed;
     }
 
@@ -327,6 +313,8 @@ PostAcceptExIoToWorker(
             wprintf(L"AcceptEx failed with error: %u\n", WSAGetLastError());
             goto Failed;
         }
+    } else {
+        assert(FALSE); // AcceptEx never completes inline.
     }
 
     ++Worker->PendingIoCount;
@@ -691,6 +679,9 @@ RunServer(
     BOOLEAN RetValue = FALSE;
     SOCKET ListenSocket = INVALID_SOCKET;
     HANDLE Iocp = NULL;
+    LINGER Linger;
+    Linger.l_onoff = 1;
+    Linger.l_linger = 0;
 
     ListenSocket = socket(Config->Address.ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (ListenSocket == INVALID_SOCKET) {
@@ -704,7 +695,19 @@ RunServer(
         goto Failed;
     }
 
-    Status = listen(ListenSocket, SOMAXCONN);
+    Status =
+        setsockopt(
+            ListenSocket,
+            SOL_SOCKET,
+            SO_LINGER,
+            (char*)&Linger,
+            sizeof(Linger));
+    if (Status == SOCKET_ERROR) {
+        wprintf(L"SO_LINGER (listener) failed with %d\n", WSAGetLastError());
+        goto Failed;
+    }
+
+    Status = listen(ListenSocket, SOMAXCONN_HINT(SOMAXCONN));
     if (Status == SOCKET_ERROR) {
         wprintf(L"listen failed with %d\n", WSAGetLastError());
     }
