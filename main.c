@@ -72,6 +72,7 @@ typedef struct GLOBAL_CONFIG {
     BOOLEAN LatencyHistogram;
     LONG AcceptIOStarted;
     LONG AcceptWorkerRef;
+    ULONG GQCSBatchSize;
     ULONG NumProcs;
     ULONG NumConns;
     ULONG NumAccepts;
@@ -342,6 +343,9 @@ IocpLoop(
     ULONG Count;
     PVOID IocpCompletionKey = NULL;
     OVERLAPPED_ENTRY IoCompletions[64];
+    ULONG GQCSBatchSize =
+        ARRAYSIZE(IoCompletions) <= GlobalConfig->GQCSBatchSize ?
+            ARRAYSIZE(IoCompletions) : GlobalConfig->GQCSBatchSize;
     WSAOVERLAPPED* IocpOverlapped;
     BOOL Success;
     CONNECT_CTX* ConnectCtx;
@@ -357,7 +361,7 @@ IocpLoop(
             GetQueuedCompletionStatusEx(
                 Worker->Iocp,
                 IoCompletions,
-                ARRAYSIZE(IoCompletions),
+                GQCSBatchSize,
                 &Count,
                 INFINITE,
                 FALSE);
@@ -841,6 +845,7 @@ ParseCmd(
     Config->NumConns = DEFAULT_NUM_CONNS;
     Config->NumAccepts = DEFAULT_NUM_ACCEPTS;
     Config->DurationInSec = DEFAULT_DURATION_IN_SEC;
+    Config->GQCSBatchSize = 0xFFFFFFFF;
 
     while (Index < Argc) {
         if (_wcsicmp(Args[Index], L"-c") == 0 ||
@@ -880,14 +885,21 @@ ParseCmd(
             } else {
                 goto Done;
             }
-        }  else if (_wcsicmp(Args[Index], L"-r") == 0) {
+        } else if (_wcsicmp(Args[Index], L"-r") == 0) {
             ++Index;
             if (Index < Argc) {
                 Config->NumProcs = _wtoi(Args[Index]);
             } else {
                 goto Done;
             }
-        }  else if (_wcsicmp(Args[Index], L"-m") == 0) {
+        } else if (_wcsicmp(Args[Index], L"-b") == 0) {
+            ++Index;
+            if (Index < Argc) {
+                Config->GQCSBatchSize = _wtoi(Args[Index]);
+            } else {
+                goto Done;
+            }
+        } else if (_wcsicmp(Args[Index], L"-m") == 0) {
             Config->RandomizedPorts = TRUE;
         } else if (_wcsicmp(Args[Index], L"-h") == 0) {
             Config->LatencyHistogram = TRUE;
