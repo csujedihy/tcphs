@@ -2,7 +2,7 @@ Build:
 msbuild tcphs.vcxproj /p:Configuration=Release /p:Platform=x64
 
 Server:
-tcphs.exe -s 127.0.0.1 -p 5555
+tcphs.exe -s -p 5555
 
 Client:
 tcphs.exe -c 127.0.0.1 -p 5555
