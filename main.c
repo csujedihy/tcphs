@@ -67,7 +67,8 @@ typedef struct WORKER {
 typedef struct GLOBAL_CONFIG {
     Role Role;
     HANDLE TerminationEvent;
-    SOCKADDR_STORAGE Address;
+    SOCKADDR_STORAGE RemoteAddress;
+    SOCKADDR_STORAGE LocalAddress;
     BOOLEAN RandomizedPorts;
     BOOLEAN LatencyHistogram;
     LONG AcceptIOStarted;
@@ -183,13 +184,22 @@ PostConnectExIoToWorker(
     memset(&ConnectCtx->Overlapped, 0, sizeof(ConnectCtx->Overlapped));
     ConnectCtx->Socket =
         WSASocket(
-            GlobalConfig->Address.ss_family,
+            AF_INET6,
             SOCK_STREAM,
             IPPROTO_IP,
             NULL,
             0,
             WSA_FLAG_OVERLAPPED);
     if (ConnectCtx->Socket == INVALID_SOCKET) {
+        goto Failed;
+    }
+
+    INT Opt = 0;
+    Status =
+        setsockopt(
+            ConnectCtx->Socket, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&Opt, sizeof(Opt));
+    if (Status == SOCKET_ERROR) {
+        Worker->FailedConnectCount++;
         goto Failed;
     }
 
@@ -220,18 +230,10 @@ PostConnectExIoToWorker(
         }
     }
 
-    if (GlobalConfig->Address.ss_family == AF_INET) {
-        IN4ADDR_SETANY((PSOCKADDR_IN)&LocalAddress);
-    } else {
-        IN6ADDR_SETANY((PSOCKADDR_IN6)&LocalAddress);
-    }
-
-    SS_PORT(&LocalAddress) = 0;
-
     Status =
         bind(
             ConnectCtx->Socket,
-            (PSOCKADDR)&LocalAddress,
+            (PSOCKADDR)&GlobalConfig->LocalAddress,
             sizeof(LocalAddress));
     if (Status == SOCKET_ERROR) {
         Worker->FailedBindCount++;
@@ -245,8 +247,8 @@ PostConnectExIoToWorker(
 
     if (!FnConnectEx(
             ConnectCtx->Socket,
-            (PSOCKADDR)&GlobalConfig->Address,
-            sizeof(GlobalConfig->Address),
+            (PSOCKADDR)&GlobalConfig->RemoteAddress,
+            sizeof(GlobalConfig->RemoteAddress),
             NULL,
             0,
             NULL,
@@ -287,7 +289,7 @@ PostAcceptExIoToWorker(
     memset(&AcceptCtx->Overlapped, 0, sizeof(AcceptCtx->Overlapped));
     AcceptCtx->Socket =
         WSASocket(
-            GlobalConfig->Address.ss_family,
+            AF_INET6,
             SOCK_STREAM,
             IPPROTO_IP,
             NULL,
@@ -578,10 +580,10 @@ RunClient(
         wprintf(
             L"Connecting to %s:%d\n",
             GetIpStringFromAddress(
-                &Config->Address,
+                &Config->RemoteAddress,
                 AddressBuffer,
                 sizeof(AddressBuffer)),
-            ntohs(SS_PORT(&Config->Address)));
+            ntohs(SS_PORT(&Config->RemoteAddress)));
 
         NotifyWorkers(Config, TestStart);
         WaitForSingleObject(Config->TerminationEvent, Config->DurationInSec * 1000);
@@ -687,15 +689,18 @@ RunServer(
     Linger.l_onoff = 1;
     Linger.l_linger = 0;
 
-    ListenSocket = socket(Config->Address.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    ListenSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (ListenSocket == INVALID_SOCKET) {
         wprintf(L"socket failed with %d\n", WSAGetLastError());
         goto Failed;
     }
 
-    Status = bind(ListenSocket, (PSOCKADDR)&Config->Address, sizeof(Config->Address));
+    INT Opt = 0;
+    Status =
+        setsockopt(
+            ListenSocket, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&Opt, sizeof(Opt));
     if (Status == SOCKET_ERROR) {
-        wprintf(L"bind failed with %d\n", WSAGetLastError());
+        wprintf(L"IPPROTO_IPV6 failed with %d\n", WSAGetLastError());
         goto Failed;
     }
 
@@ -708,6 +713,12 @@ RunServer(
             sizeof(Linger));
     if (Status == SOCKET_ERROR) {
         wprintf(L"SO_LINGER (listener) failed with %d\n", WSAGetLastError());
+        goto Failed;
+    }
+
+    Status = bind(ListenSocket, (PSOCKADDR)&Config->LocalAddress, sizeof(Config->LocalAddress));
+    if (Status == SOCKET_ERROR) {
+        wprintf(L"bind failed with %d\n", WSAGetLastError());
         goto Failed;
     }
 
@@ -732,10 +743,10 @@ RunServer(
     wprintf(
         L"Listening on %s:%d\n",
         GetIpStringFromAddress(
-            &Config->Address,
+            &Config->LocalAddress,
             AddressBuffer,
             sizeof(AddressBuffer)),
-        ntohs(SS_PORT(&Config->Address)));
+        ntohs(SS_PORT(&Config->LocalAddress)));
 
     // All workers share the same IO context array.
     void* IoContexts = calloc(Config->NumAccepts, sizeof(ACCEPT_CTX));
@@ -819,6 +830,8 @@ ParseIPAddress(
     } else if (InetPtonW(AF_INET, IpAddress, &Addr4)) {
         SockAddr->si_family = AF_INET;
         memcpy(&SockAddr->Ipv4.sin_addr, &Addr4, sizeof(Addr4));
+    } else {
+        return -1;
     }
 
     return SockAddr->si_family;
@@ -846,21 +859,38 @@ ParseCmd(
     Config->NumAccepts = DEFAULT_NUM_ACCEPTS;
     Config->DurationInSec = DEFAULT_DURATION_IN_SEC;
     Config->GQCSBatchSize = 0xFFFFFFFF;
+    IN6ADDR_SETANY((PSOCKADDR_IN6)&Config->LocalAddress); // dual mode socket
 
     while (Index < Argc) {
-        if (_wcsicmp(Args[Index], L"-c") == 0 ||
-            _wcsicmp(Args[Index], L"-s") == 0) {
-            Config->Role = (INT)Args[Index][1];
+        if (_wcsicmp(Args[Index], L"-c") == 0) {
+            Config->Role = RoleClient;
             ++Index;
             if (Index < Argc) {
-                ParseIPAddress(Args[Index], (PSOCKADDR_INET)&Config->Address);
+                SOCKADDR_STORAGE TempAddr = { 0 };
+                if (ParseIPAddress(Args[Index], (PSOCKADDR_INET)&TempAddr) == -1) {
+                    wprintf(L"Invalid IP address: %s\n", Args[Index]);
+                    goto Done;
+                }
+                if (TempAddr.ss_family == AF_INET) {
+                    SCOPE_ID Scope = {0};
+                    IN6ADDR_SETV4MAPPED(
+                        (SOCKADDR_IN6*)&Config->RemoteAddress, &((SOCKADDR_IN*)&TempAddr)->sin_addr, Scope, 0);
+                } else {
+                    Config->RemoteAddress = TempAddr;
+                }
             } else {
                 goto Done;
             }
-        } else if (_wcsicmp(Args[Index], L"-p") == 0) {
+        } else if (_wcsicmp(Args[Index], L"-s") == 0) {
+            Config->Role = RoleServer;
+        }else if (_wcsicmp(Args[Index], L"-p") == 0) {
             ++Index;
             if (Index < Argc) {
-                SS_PORT(&Config->Address) = htons((USHORT)_wtoi(Args[Index]));
+                if (Config->Role == RoleClient) {
+                    SS_PORT(&Config->RemoteAddress) = htons((USHORT)_wtoi(Args[Index]));
+                } else {
+                    SS_PORT(&Config->LocalAddress) = htons((USHORT)_wtoi(Args[Index]));
+                }
             } else {
                 goto Done;
             }
@@ -892,10 +922,28 @@ ParseCmd(
             } else {
                 goto Done;
             }
-        } else if (_wcsicmp(Args[Index], L"-b") == 0) {
+        } else if (_wcsicmp(Args[Index], L"-g") == 0) {
             ++Index;
             if (Index < Argc) {
                 Config->GQCSBatchSize = _wtoi(Args[Index]);
+            } else {
+                goto Done;
+            }
+        }  else if (_wcsicmp(Args[Index], L"-b") == 0) {
+            ++Index;
+            if (Index < Argc && Config->Role == RoleClient) {
+                SOCKADDR_STORAGE TempAddr = { 0 };
+                if (ParseIPAddress(Args[Index], (PSOCKADDR_INET)&TempAddr) == -1) {
+                    wprintf(L"Invalid IP address: %s\n", Args[Index]);
+                    goto Done;
+                }
+                if (TempAddr.ss_family == AF_INET) {
+                    SCOPE_ID Scope = {0};
+                    IN6ADDR_SETV4MAPPED(
+                        (SOCKADDR_IN6*)&Config->LocalAddress, &((SOCKADDR_IN*)&TempAddr)->sin_addr, Scope, 0);
+                } else {
+                    Config->LocalAddress = TempAddr;
+                }
             } else {
                 goto Done;
             }
@@ -962,7 +1010,7 @@ wmain(
 
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
-    Socket = socket(GlobalConfig->Address.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    Socket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     Status =
         WSAIoctl(
             Socket,
