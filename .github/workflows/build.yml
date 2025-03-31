@@ -34,8 +34,8 @@ jobs:
 
     # Build the project
     - name: Build Project
-          run: |
-            msbuild tcphs.vcxproj /p:Configuration=Release /p:Platform=x64 /maxcpucount
+      run: |
+        msbuild tcphs.vcxproj /p:Configuration=Release /p:Platform=x64 /maxcpucount
 
     # Optional: Upload build artifacts
     - name: Upload build artifacts
