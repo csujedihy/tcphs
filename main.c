@@ -617,20 +617,19 @@ RunClient(
     }
 
     if (ThreadIdx == Config->NumProcs) {
-        WCHAR AddressBuffer[100] = { 0 };
+        WCHAR AddressBufferRemote[100] = { 0 };
+        WCHAR AddressBufferLocal[100] = { 0 };
         LOGI(
-            L"Connecting to %s:%d",
+            L"Connecting to %s:%d from %s\n",
             GetIpStringFromAddress(
                 &Config->RemoteAddress,
-                AddressBuffer,
-                sizeof(AddressBuffer)),
-            ntohs(SS_PORT(&Config->RemoteAddress)));
-        LOGI(
-            L" from %s\n",
+                AddressBufferRemote,
+                sizeof(AddressBufferRemote)),
+            ntohs(SS_PORT(&Config->RemoteAddress)),
             GetIpStringFromAddress(
                 &Config->LocalAddress,
-                AddressBuffer,
-                sizeof(AddressBuffer)));
+                AddressBufferLocal,
+                sizeof(AddressBufferLocal)));
 
         NotifyWorkers(Config, TestStart);
         WaitForSingleObject(Config->TerminationEvent, Config->DurationInSec * 1000);
@@ -995,13 +994,6 @@ ParseCmd(
                 } else {
                     Config->LocalAddress = TempAddr;
                 }
-                WCHAR AddressBuffer[100] = { 0 };
-                LOGI(
-                    L"Local Address to be bound %s\n",
-                    GetIpStringFromAddress(
-                        &Config->LocalAddress,
-                        AddressBuffer,
-                        sizeof(AddressBuffer)));
             } else {
                 goto Done;
             }
