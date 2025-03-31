@@ -1,0 +1,52 @@
+name: Build
+
+# Trigger the workflow on push or pull request to main branch
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Define the job
+jobs:
+  build:
+    # Use Windows environment
+    runs-on: windows-latest
+
+    steps:
+    # Checkout the repository code
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    # Setup MSBuild
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v1.1
+      with:
+        vs-version: '17.0'  # Visual Studio 2022
+
+    # Optional: Setup NuGet (uncomment if your .vcxproj uses NuGet packages)
+    #- name: Setup NuGet
+    #  uses: NuGet/setup-nuget@v1
+
+    # Optional: Restore NuGet packages (uncomment if your project uses NuGet)
+    #- name: Restore NuGet packages
+    #  run: nuget restore tcphs.vcxproj
+
+    # Build the project
+    - name: Build Project
+      run: |
+        msbuild tcphs.vcxproj ^
+          /p:Configuration=Release ^
+          /p:Platform="x64" ^
+          /maxcpucount ^
+          /verbosity:minimal
+
+    # Optional: Upload build artifacts
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-output
+        path: |
+          x64/Release/
+          *.exe
+          *.dll
