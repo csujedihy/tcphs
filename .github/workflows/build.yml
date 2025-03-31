@@ -43,6 +43,4 @@ jobs:
       with:
         name: build-output
         path: |
-          x64/Release/
-          *.exe
-          *.dll
+          bin\Release\x64\*.*
