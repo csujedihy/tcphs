@@ -70,6 +70,7 @@ typedef struct GLOBAL_CONFIG {
     SOCKADDR_STORAGE RemoteAddress;
     SOCKADDR_STORAGE LocalAddress;
     BOOLEAN RandomizedPorts;
+    BOOLEAN PortScalability;
     BOOLEAN LatencyHistogram;
     LONG AcceptIOStarted;
     LONG AcceptWorkerRef;
@@ -118,6 +119,32 @@ LPFN_CONNECTEX FnConnectEx = NULL;
 GUID GuidConnectEx = WSAID_CONNECTEX;
 LARGE_INTEGER QPCFreq;
 
+typedef enum {
+    LOG_INFO = 0,
+    LOG_VERBOSE = 1,
+} LogLevel;
+
+#define LOGI(Format, ...) LOG(LOG_INFO, Format, __VA_ARGS__)
+#define LOGV(Format, ...) LOG(LOG_VERBOSE, Format, __VA_ARGS__)
+
+LogLevel LoggingLevel = LOG_INFO;
+
+void
+LOG(
+    LogLevel Level,
+    const wchar_t* Format,
+    ...)
+{
+    if (Level > LoggingLevel) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, Format);
+    vfwprintf(stdout, Format, args);
+    va_end(args);
+}
+
 inline
 ULONG
 GetUsTicks(
@@ -157,7 +184,7 @@ CtrlHandler(
     case CTRL_LOGOFF_EVENT:
     case CTRL_SHUTDOWN_EVENT:
     case CTRL_CLOSE_EVENT:
-        wprintf(L"Exiting IOCP loop...\n");
+        LOGV(L"Exiting IOCP loop...\n");
         NotifyWorkers(GlobalConfig, IoLoopEnd);
         SetEvent(GlobalConfig->TerminationEvent);
         break;
@@ -215,6 +242,21 @@ PostConnectExIoToWorker(
         goto Failed;
     }
 
+    if (GlobalConfig->PortScalability) {
+        DWORD Opt = 1;
+        Status =
+            setsockopt(
+                ConnectCtx->Socket,
+                SOL_SOCKET,
+                SO_PORT_SCALABILITY,
+                (char*)&Opt,
+                sizeof(Opt));
+        if (Status == SOCKET_ERROR) {
+            Worker->FailedConnectCount++;
+            goto Failed;
+        }
+    }
+
     if (GlobalConfig->RandomizedPorts) {
         DWORD Opt = 1;
         Status =
@@ -255,7 +297,7 @@ PostConnectExIoToWorker(
             &ConnectCtx->Overlapped)) {
         Status = WSAGetLastError();
         if (Status != WSA_IO_PENDING) {
-            wprintf(L"ConnectEx failed with error: %u\n", WSAGetLastError());
+            LOGI(L"ConnectEx failed with error: %u\n", WSAGetLastError());
             goto Failed;
         }
     }
@@ -313,7 +355,7 @@ PostAcceptExIoToWorker(
             &AcceptCtx->Overlapped)) {
         Status = WSAGetLastError();
         if (Status != WSA_IO_PENDING) {
-            wprintf(L"AcceptEx failed with error: %u\n", WSAGetLastError());
+            LOGI(L"AcceptEx failed with error: %u\n", WSAGetLastError());
             goto Failed;
         }
     } else {
@@ -356,7 +398,7 @@ IocpLoop(
     DWORD ThreadId = GetCurrentThreadId();
     BOOLEAN ShouldCleanUpServer = FALSE;
 
-    wprintf(L"(%d) Entering IOCP loop...\n", ThreadId);
+    LOGV(L"(%d) Entering IOCP loop...\n", ThreadId);
 
     while (Worker->Running) {
         Success =
@@ -369,7 +411,7 @@ IocpLoop(
                 FALSE);
         Status = WSAGetLastError();
         if (Success == FALSE) {
-            wprintf(L"GetQueuedCompletionStatusEx failed: 0x%x\n", Status);
+            LOGI(L"GetQueuedCompletionStatusEx failed: 0x%x\n", Status);
         }
         ULONG Now = GetUsTicks();
         for (ULONG OvId = 0; OvId < Count; ++OvId) {
@@ -468,7 +510,7 @@ IocpLoop(
         }
     }
 
-    wprintf(
+    LOGV(
         L"(%d) stats: %lu pending %llu completed\n",
         ThreadId,
         PendingIoCount,
@@ -537,7 +579,7 @@ RunClient(
 
     ThreadArray = (PHANDLE)calloc(1, sizeof(HANDLE) * Config->NumProcs);
     if (ThreadArray == NULL) {
-        wprintf(L"Failed to allocate memory for ThreadArray\n");
+        LOGI(L"Failed to allocate memory for ThreadArray\n");
         goto Failed;
     }
 
@@ -547,7 +589,7 @@ RunClient(
 
         Worker->IoContexts = calloc(Config->NumConns, sizeof(CONNECT_CTX));
         if (Worker->IoContexts == NULL) {
-            wprintf(L"Failed to allocate IoContexts array\n");
+            LOGI(L"Failed to allocate IoContexts array\n");
             goto Failed;
         }
 
@@ -559,7 +601,7 @@ RunClient(
                 (ULONG_PTR)ClientCompletionKey,
                 0);
         if (Worker->Iocp == NULL) {
-            wprintf(
+            LOGI(
                 L"CreateIoCompletionPort failed with error: %u\n",
                 GetLastError());
             goto Failed;
@@ -571,19 +613,23 @@ RunClient(
         WORKER* Worker = &Config->Workers[ThreadIdx];
         ThreadArray[ThreadIdx] = CreateThread(NULL, 0, IocpLoop, Worker, 0, NULL);
         if (ThreadArray[ThreadIdx] == NULL) {
-            wprintf(L"CreateThread failed with %d\n", GetLastError());
+            LOGI(L"CreateThread failed with %d\n", GetLastError());
             break;
         }
     }
 
     if (ThreadIdx == Config->NumProcs) {
-        wprintf(
-            L"Connecting to %s:%d\n",
+        LOGI(
+            L"Connecting to %s:%d from %s\n",
             GetIpStringFromAddress(
                 &Config->RemoteAddress,
                 AddressBuffer,
                 sizeof(AddressBuffer)),
-            ntohs(SS_PORT(&Config->RemoteAddress)));
+            ntohs(SS_PORT(&Config->RemoteAddress)),
+            GetIpStringFromAddress(
+                &Config->LocalAddress,
+                AddressBuffer,
+                sizeof(AddressBuffer)));
 
         NotifyWorkers(Config, TestStart);
         WaitForSingleObject(Config->TerminationEvent, Config->DurationInSec * 1000);
@@ -599,13 +645,13 @@ RunClient(
         FailedBindCount += Config->Workers[i].FailedBindCount;
     }
 
-    wprintf(L"HPS: %lld\n", ConnectedCount / Config->DurationInSec);
-    wprintf(L"Failed connect: %lld\n", FailedConnectCount);
-    wprintf(L"Failed bind: %lld\n", FailedBindCount);
+    LOGI(L"HPS: %lld\n", ConnectedCount / Config->DurationInSec);
+    LOGI(L"Failed connect: %lld\n", FailedConnectCount);
+    LOGI(L"Failed bind: %lld\n", FailedBindCount);
 
     if (Config->LatencyHistogram) {
-        wprintf(L"\nLatency Histogram\n");
-        wprintf(L"-------------+-----------+-------------------\n");
+        LOGI(L"\nLatency Histogram\n");
+        LOGI(L"-------------+-----------+-------------------\n");
 
         // Find maximum count for scaling
         ULONG MaxCount = 0;
@@ -620,8 +666,8 @@ RunClient(
         }
 
         // Print header
-        wprintf(L"Latency (us) |   Count   | Distribution\n");
-        wprintf(L"-------------+-----------+-------------------\n");
+        LOGI(L"Latency (us) |   Count   | Distribution\n");
+        LOGI(L"-------------+-----------+-------------------\n");
 
         // Print histogram with bars (scaled to 50 characters max width)
         const ULONG MaxBarWidth = 50;
@@ -632,18 +678,18 @@ RunClient(
 
                 // Print latency range
                 if (i == HISTO_SIZE - 1) {
-                    wprintf(L"%5lu+      ", i * HISTO_GRANULARITY_US);
+                    LOGI(L"%5lu+      ", i * HISTO_GRANULARITY_US);
                 } else {
-                    wprintf(L"%5lu-%-5lu ", i * HISTO_GRANULARITY_US, (i + 1) * HISTO_GRANULARITY_US - 1);
+                    LOGI(L"%5lu-%-5lu ", i * HISTO_GRANULARITY_US, (i + 1) * HISTO_GRANULARITY_US - 1);
                 }
 
                 // Print count
-                wprintf(L" | %9u | ", Count);
+                LOGI(L" | %9u | ", Count);
                 // Print bar
                 for (ULONG j = 0; j < BarWidth; j++) {
-                    wprintf(L"#");
+                    LOGI(L"#");
                 }
-                wprintf(L"\n");
+                LOGI(L"\n");
             }
         }
     }
@@ -691,7 +737,7 @@ RunServer(
 
     ListenSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (ListenSocket == INVALID_SOCKET) {
-        wprintf(L"socket failed with %d\n", WSAGetLastError());
+        LOGI(L"socket failed with %d\n", WSAGetLastError());
         goto Failed;
     }
 
@@ -700,7 +746,7 @@ RunServer(
         setsockopt(
             ListenSocket, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&Opt, sizeof(Opt));
     if (Status == SOCKET_ERROR) {
-        wprintf(L"IPPROTO_IPV6 failed with %d\n", WSAGetLastError());
+        LOGI(L"IPPROTO_IPV6 failed with %d\n", WSAGetLastError());
         goto Failed;
     }
 
@@ -712,19 +758,19 @@ RunServer(
             (char*)&Linger,
             sizeof(Linger));
     if (Status == SOCKET_ERROR) {
-        wprintf(L"SO_LINGER (listener) failed with %d\n", WSAGetLastError());
+        LOGI(L"SO_LINGER (listener) failed with %d\n", WSAGetLastError());
         goto Failed;
     }
 
     Status = bind(ListenSocket, (PSOCKADDR)&Config->LocalAddress, sizeof(Config->LocalAddress));
     if (Status == SOCKET_ERROR) {
-        wprintf(L"bind failed with %d\n", WSAGetLastError());
+        LOGI(L"bind failed with %d\n", WSAGetLastError());
         goto Failed;
     }
 
     Status = listen(ListenSocket, SOMAXCONN_HINT(SOMAXCONN));
     if (Status == SOCKET_ERROR) {
-        wprintf(L"listen failed with %d\n", WSAGetLastError());
+        LOGI(L"listen failed with %d\n", WSAGetLastError());
     }
 
     Iocp =
@@ -734,13 +780,13 @@ RunServer(
             (ULONG_PTR)ServerCompletionKey,
             0);
     if (Iocp == NULL) {
-        wprintf(
+        LOGI(
             L"CreateIoCompletionPort failed with error: %u\n",
             GetLastError());
         goto Failed;
     }
 
-    wprintf(
+    LOGI(
         L"Listening on %s:%d\n",
         GetIpStringFromAddress(
             &Config->LocalAddress,
@@ -751,7 +797,7 @@ RunServer(
     // All workers share the same IO context array.
     void* IoContexts = calloc(Config->NumAccepts, sizeof(ACCEPT_CTX));
     if (IoContexts == NULL) {
-        wprintf(L"Failed to allocate IoContexts array\n");
+        LOGI(L"Failed to allocate IoContexts array\n");
         goto Failed;
     }
 
@@ -765,7 +811,7 @@ RunServer(
 
     ThreadArray = (PHANDLE)calloc(1, sizeof(HANDLE) * Config->NumProcs);
     if (ThreadArray == NULL) {
-        wprintf(L"Failed to allocate memory for ThreadArray\n");
+        LOGI(L"Failed to allocate memory for ThreadArray\n");
         goto Failed;
     }
 
@@ -775,7 +821,7 @@ RunServer(
         InterlockedIncrement(&Config->AcceptWorkerRef);
         ThreadArray[ThreadIdx] = CreateThread(NULL, 0, IocpLoop, Worker, 0, NULL);
         if (ThreadArray[ThreadIdx] == NULL) {
-            wprintf(L"CreateThread failed with %d\n", GetLastError());
+            LOGI(L"CreateThread failed with %d\n", GetLastError());
             break;
         }
     }
@@ -868,7 +914,7 @@ ParseCmd(
             if (Index < Argc) {
                 SOCKADDR_STORAGE TempAddr = { 0 };
                 if (ParseIPAddress(Args[Index], (PSOCKADDR_INET)&TempAddr) == -1) {
-                    wprintf(L"Invalid IP address: %s\n", Args[Index]);
+                    LOGI(L"Invalid IP address: %s\n", Args[Index]);
                     goto Done;
                 }
                 if (TempAddr.ss_family == AF_INET) {
@@ -934,13 +980,15 @@ ParseCmd(
             if (Index < Argc && Config->Role == RoleClient) {
                 SOCKADDR_STORAGE TempAddr = { 0 };
                 if (ParseIPAddress(Args[Index], (PSOCKADDR_INET)&TempAddr) == -1) {
-                    wprintf(L"Invalid IP address: %s\n", Args[Index]);
+                    LOGI(L"Invalid IP address: %s\n", Args[Index]);
                     goto Done;
                 }
                 if (TempAddr.ss_family == AF_INET) {
                     SCOPE_ID Scope = {0};
                     IN6ADDR_SETV4MAPPED(
-                        (SOCKADDR_IN6*)&Config->LocalAddress, &((SOCKADDR_IN*)&TempAddr)->sin_addr, Scope, 0);
+                        (SOCKADDR_IN6*)&Config->LocalAddress,
+                        &((SOCKADDR_IN*)&TempAddr)->sin_addr,
+                        Scope, 0);
                 } else {
                     Config->LocalAddress = TempAddr;
                 }
@@ -951,7 +999,11 @@ ParseCmd(
             Config->RandomizedPorts = TRUE;
         } else if (_wcsicmp(Args[Index], L"-h") == 0) {
             Config->LatencyHistogram = TRUE;
-        } else {
+        } else if (_wcsicmp(Args[Index], L"-l") == 0) {
+            Config->PortScalability = TRUE;
+        } else if (_wcsicmp(Args[Index], L"-v") == 0) {
+            LoggingLevel = LOG_VERBOSE;
+        }else {
             goto Done;
         }
 
@@ -969,7 +1021,7 @@ PrintUsage(
     VOID
     )
 {
-    wprintf(USAGE);
+    LOGI(USAGE);
 }
 
 INT
@@ -997,14 +1049,23 @@ wmain(
             1,
             sizeof(GLOBAL_CONFIG) + sizeof(WORKER) * (TempConfig.NumProcs - 1));
     if (GlobalConfig == NULL) {
-        wprintf(L"Failed to allocate memory for GlobalConfig\n");
+        LOGI(L"Failed to allocate memory for GlobalConfig\n");
         goto Done;
     }
 
     *GlobalConfig = TempConfig;
+    LOGV(L"Configs:\n");
+    LOGV(L"  Role: %s\n", GlobalConfig->Role == RoleClient ? L"Client" : L"Server");
+    LOGV(L"  NumProcs: %lu\n", GlobalConfig->NumProcs);
+    LOGV(L"  NumConns: %lu\n", GlobalConfig->NumConns);
+    LOGV(L"  NumAccepts: %lu\n", GlobalConfig->NumAccepts);
+    LOGV(L"  DurationInSec: %lu\n", GlobalConfig->DurationInSec);
+    LOGV(L"  GQCSBatchSize: %lu\n", GlobalConfig->GQCSBatchSize);
+    LOGV(L"  RandomizedPorts: %s\n", GlobalConfig->RandomizedPorts ? L"TRUE" : L"FALSE");
+    LOGV(L"  PortScalability: %s\n", GlobalConfig->PortScalability ? L"TRUE" : L"FALSE");
 
     if (!QueryPerformanceFrequency(&QPCFreq)) {
-        wprintf(L"QueryPerformanceFrequency failed with %d\n", GetLastError());
+        LOGI(L"QueryPerformanceFrequency failed with %d\n", GetLastError());
         goto Done;
     }
 
@@ -1019,7 +1080,7 @@ wmain(
             sizeof(GuidConnectEx), &FnConnectEx, sizeof(FnConnectEx),
             &Bytes, NULL, NULL);
     if (Status == SOCKET_ERROR) {
-        wprintf(L"WSAIoctl failed with error: %u\n", WSAGetLastError());
+        LOGI(L"WSAIoctl failed with error: %u\n", WSAGetLastError());
         goto Done;
     }
 
@@ -1031,13 +1092,13 @@ wmain(
             &FnAcceptEx, sizeof(FnAcceptEx),
             &Bytes, NULL, NULL);
     if (Status == SOCKET_ERROR) {
-        wprintf(L"WSAIoctl failed with error: %u\n", WSAGetLastError());
+        LOGI(L"WSAIoctl failed with error: %u\n", WSAGetLastError());
         goto Done;
     }
 
     GlobalConfig->TerminationEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (GlobalConfig->TerminationEvent == NULL) {
-        wprintf(L"CreateEvent failed with error: %u\n", GetLastError());
+        LOGI(L"CreateEvent failed with error: %u\n", GetLastError());
         goto Done;
     }
 
@@ -1059,6 +1120,6 @@ wmain(
 Done:
     SetConsoleCtrlHandler(CtrlHandler, FALSE);
     WSACleanup();
-    wprintf(L"Done...\n");
+    LOGI(L"Done...\n");
     return Status;
 }
