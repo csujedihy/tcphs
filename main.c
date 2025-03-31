@@ -202,7 +202,6 @@ PostConnectExIoToWorker(
     )
 {
     CONNECT_CTX* ConnectCtx = &((CONNECT_CTX*)Worker->IoContexts)[Idx];
-    SOCKADDR_STORAGE LocalAddress = { 0 };
     INT Status = 0;
     LINGER Linger;
     Linger.l_onoff = 1;
@@ -276,7 +275,7 @@ PostConnectExIoToWorker(
         bind(
             ConnectCtx->Socket,
             (PSOCKADDR)&GlobalConfig->LocalAddress,
-            sizeof(LocalAddress));
+            sizeof(GlobalConfig->LocalAddress));
     if (Status == SOCKET_ERROR) {
         Worker->FailedBindCount++;
         goto Failed;
@@ -568,7 +567,6 @@ RunClient(
     GLOBAL_CONFIG* Config
     )
 {
-    WCHAR AddressBuffer[100] = { 0 };
     PHANDLE ThreadArray = NULL;
     INT Status = 0;
     BOOLEAN RetValue = FALSE;
@@ -619,13 +617,16 @@ RunClient(
     }
 
     if (ThreadIdx == Config->NumProcs) {
+        WCHAR AddressBuffer[100] = { 0 };
         LOGI(
-            L"Connecting to %s:%d from %s\n",
+            L"Connecting to %s:%d",
             GetIpStringFromAddress(
                 &Config->RemoteAddress,
                 AddressBuffer,
                 sizeof(AddressBuffer)),
-            ntohs(SS_PORT(&Config->RemoteAddress)),
+            ntohs(SS_PORT(&Config->RemoteAddress)));
+        LOGI(
+            L" from %s\n",
             GetIpStringFromAddress(
                 &Config->LocalAddress,
                 AddressBuffer,
@@ -920,7 +921,9 @@ ParseCmd(
                 if (TempAddr.ss_family == AF_INET) {
                     SCOPE_ID Scope = {0};
                     IN6ADDR_SETV4MAPPED(
-                        (SOCKADDR_IN6*)&Config->RemoteAddress, &((SOCKADDR_IN*)&TempAddr)->sin_addr, Scope, 0);
+                        (SOCKADDR_IN6*)&Config->RemoteAddress,
+                        &((SOCKADDR_IN*)&TempAddr)->sin_addr,
+                        Scope, 0);
                 } else {
                     Config->RemoteAddress = TempAddr;
                 }
@@ -992,6 +995,13 @@ ParseCmd(
                 } else {
                     Config->LocalAddress = TempAddr;
                 }
+                WCHAR AddressBuffer[100] = { 0 };
+                LOGI(
+                    L"Local Address to be bound %s\n",
+                    GetIpStringFromAddress(
+                        &Config->LocalAddress,
+                        AddressBuffer,
+                        sizeof(AddressBuffer)));
             } else {
                 goto Done;
             }
