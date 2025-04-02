@@ -67,24 +67,13 @@ jobs:
         make clean || true  # Continue even if clean fails
         make all || make  # Try 'make all' first, fallback to 'make'
 
-    - name: Build Linux
-      working-directory: ./linux
-      shell: bash
-      run: |
-        pwd
-        ls
-        ls ./linux
-
     # Upload build artifacts
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: linux-build
         path: |
-          linux/*.o
-          linux/*.a
-          linux/*.so
-          linux/*  # This catches any executable files without extension
+          linux/tcphs  # This catches any executable files without extension
 
     # Optional: Add cleanup step
     - name: Clean up
