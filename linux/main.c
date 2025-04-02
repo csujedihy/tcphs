@@ -257,9 +257,7 @@ error:
 
 int
 run_server() {
-    int ret = -1;
     int t_idx = 0;
-    int sock = 0;
 
     for (; t_idx < g_config->num_procs; ++t_idx) {
         struct worker* worker = &g_config->workers[t_idx];
@@ -415,8 +413,6 @@ run_client() {
     printf("Failed connects: %lld\n", g_config->workers[0].failed_connect_count);
     printf("Failed binds: %lld\n", g_config->workers[0].failed_bind_count);
 
-error:
-
     for (int i = 0; i < t_idx; ++i) {
         if (g_config->workers[i].ep_fd != -1) {
             close(g_config->workers[i].ep_fd);
@@ -446,7 +442,6 @@ parse_ip_address(
     struct sockaddr_storage* sa
     )
 {
-    int ret = 0;
     struct in_addr addr4;
     struct in6_addr addr6;
 
