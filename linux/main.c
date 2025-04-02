@@ -18,7 +18,7 @@
 #include <sys/eventfd.h>
 #include <stdatomic.h>
 
-#define USAGE "Usage: tcphs -s|-c <ip> [-p <port>] [-o <num conns>] [-a <num accepts>] [-t <duration in sec>] [-r <num procs>]\n"
+#define USAGE "Usage: tcphs -s|-c <ip> [-p <port>] [-o <num conns>] [-t <duration in sec>] [-r <num procs>]\n"
 #define DEFAULT_NUM_CONNS 16
 #define DEFAULT_DURATION_IN_SEC 5
 #define HISTO_SIZE 512
@@ -380,7 +380,7 @@ run_client() {
             perror("epoll_ctl for event_fd failed");
             break;
         }
-        
+
         worker->running = 1;
         atomic_thread_fence(memory_order_release);
 
