@@ -115,6 +115,7 @@ notify_workers(
             continue;
         }
 
+        // FIXME: this is a wrong usage of eventfd.
         if (eventfd_write(event_fd, sig)) {
             perror("Failed to notify worker");
         }
