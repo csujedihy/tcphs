@@ -106,98 +106,21 @@ print_ip_port(
     printf("%s:%d\n", ip_str, ntohs(((struct sockaddr_in6*)sa)->sin6_port));
 }
 
-int
-run_server() {
-    int listen_fd = -1;
-    int ep_fd = -1;
-    int opt = 0;
-    int ret = -1;
-    struct sockaddr_storage address;
-    struct epoll_event event;
-    struct epoll_event events[MAX_EVENTS];
-    int addrlen = sizeof(address);
-
-    
-    if ((listen_fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0)) == 0) {
-        goto error;
-    }
-
-    if (setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt))) {
-        perror("setsockopt (IPV6_V6ONLY) failed");
-        goto error;
-    }
-
-    if (bind(listen_fd, (struct sockaddr*)&g_config->local_addr, sizeof(g_config->local_addr))) {
-        perror("bind failed");
-        goto error;
-    }
-
-    ep_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (ep_fd == -1) {
-        perror("Epoll create failed");
-        goto error;
-    }
-
-    event.events = EPOLLIN | EPOLLET;
-    event.data.fd = listen_fd;
-    if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, listen_fd, &event) == -1) {
-        perror("Epoll ctl failed");
-        goto error;
-    }
-
-    if (listen(listen_fd, 4096) < 0) {
-        perror("Listen failed");
-        goto error;
-    }
-
-    printf("Listening on port %d...\n", ntohs(((struct sockaddr_in6*)&g_config->local_addr)->sin6_port));
-
-    while (1) {
-        int nfds = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
-        if (nfds == -1) {
-            if (errno == EINTR) {
-                continue;  // Interrupted by a signal, retry
-            }
-            perror("epoll wait failed");
-            goto error;
+void
+notify_workers(
+    test_signal sig
+    )
+{
+    for (int i = 0; i < g_config->num_procs; ++i) {
+        int event_fd = g_config->workers[i].event_fd;
+        if (event_fd == -1) {
+            continue;
         }
 
-        for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == listen_fd) {
-                // drain the listen socket until the accept queue is empty
-                while (1) {
-                    int new_socket = accept(listen_fd, NULL, NULL);
-                    if (new_socket == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;  // No more connections to accept
-                        }
-                        perror("Accept failed");
-                        continue;
-                    }
-
-                    if (set_socket_nolinger(new_socket)) {
-                        perror("Failed to set socket to non-linger");
-                        close(new_socket);
-                        continue;
-                    }
-                    close(new_socket);
-                }
-            }
+        if (eventfd_write(event_fd, sig)) {
+            perror("Failed to notify worker");
         }
     }
-
-    ret = 0;
-
-error:
-    if (listen_fd != -1) {
-        close(listen_fd);
-    }
-
-    if (ep_fd != -1) {
-        close(ep_fd);
-    }
-
-    return ret;
 }
 
 void
@@ -254,7 +177,7 @@ done:
 }
 
 void*
-client_worker(
+io_loop(
     void* arg
     )
 {
@@ -287,7 +210,34 @@ client_worker(
                 } else if (val == test_end) {
                     worker->running = 0;
                 }
+            } else if (event->data.fd == worker->listen_fd) {
+                // Drain the listen socket until the accept queue is empty
+                while (1) {
+                    int new_socket = accept(worker->listen_fd, NULL, NULL);
+                    if (new_socket == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;  // No more connections to accept
+                        }
+                        perror("Accept failed");
+                        continue;
+                    }
+
+                    if (set_socket_nolinger(new_socket)) {
+                        perror("Failed to set socket to non-linger");
+                        close(new_socket);
+                        continue;
+                    }
+
+                    close(new_socket);
+                }
             } else {
+                // It's possible that we get a EPOLLERR event because
+                // the peer also closes forcibly right after the conn
+                // is established. The ERR and OUT events are not mutually
+                // exclusive and could be bundled up. So, we need to
+                // first check EPOLLOUT to count the successful connects 
+                // and treat EPOLLERR as a failure only when EPOLLOUT is
+                // not set.
                 if (event->events & EPOLLOUT) {
                     worker->connected_count++;
                 } else if (event->events & EPOLLERR) {
@@ -305,28 +255,103 @@ error:
     return NULL;
 }
 
-void
-notify_workers(
-    test_signal sig
-    )
-{
-    for (int i = 0; i < g_config->num_procs; ++i) {
-        int event_fd = g_config->workers[i].event_fd;
-        if (event_fd == -1) {
-            continue;
+int
+run_server() {
+    int ret = -1;
+    int t_idx = 0;
+    int sock = 0;
+
+    for (; t_idx < g_config->num_procs; ++t_idx) {
+        struct worker* worker = &g_config->workers[t_idx];
+        int opt;
+
+        if ((worker->listen_fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0)) == 0) {
+            break;
+        }
+    
+        opt = 0;
+        if (setsockopt(worker->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt))) {
+            perror("setsockopt (IPV6_V6ONLY) failed");
+            break;
         }
 
-        if (eventfd_write(event_fd, sig)) {
-            perror("Failed to notify worker");
+        opt = 1;
+        if (setsockopt(worker->listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt))) {
+            perror("setsockopt (SO_REUSEPORT) failed");
+            break;
+        }
+    
+        if (bind(
+                worker->listen_fd,
+                (struct sockaddr*)&g_config->local_addr,
+                sizeof(g_config->local_addr))) {
+            perror("bind failed");
+            break;
+        }
+    
+        worker->ep_fd = epoll_create1(EPOLL_CLOEXEC);
+        if (worker->ep_fd == -1) {
+            perror("Epoll create failed");
+            break;
+        }
+
+        if (epoll_ctl(
+                worker->ep_fd, 
+                EPOLL_CTL_ADD,
+                worker->listen_fd,
+                &(struct epoll_event){
+                    .events = EPOLLIN | EPOLLET,
+                    .data.fd = worker->listen_fd}) == -1) {
+            perror("Epoll ctl failed");
+            break;
+        }
+
+        if (listen(worker->listen_fd, 4096) < 0) {
+            perror("Listen failed");
+            break;
+        }
+
+        atomic_store_explicit(&worker->running, 1, memory_order_release);
+
+        if (pthread_create(&worker->thread, NULL, io_loop, worker)) {
+            perror("Failed to create thread");
+            break;
         }
     }
+
+    if (t_idx != g_config->num_procs) {
+        notify_workers(test_end);
+    } else {
+        printf("%d workers listening on ", g_config->num_procs);
+        print_ip_port(&g_config->local_addr);
+    }
+
+    // Wait for all threads to join
+    for (int i = 0; i < t_idx; ++i) {
+        struct worker* worker = &g_config->workers[i];
+
+        if (worker->thread) {
+            pthread_join(worker->thread, NULL);
+        }
+    }
+
+    for (int i = 0; i < t_idx; ++i) {
+        if (g_config->workers[i].ep_fd != -1) {
+            close(g_config->workers[i].ep_fd);
+        }
+
+        if (g_config->workers[i].event_fd != -1) {
+            close(g_config->workers[i].event_fd);
+        }
+    }
+
+    return 0;
 }
 
 int
 run_client() {
     int ret = -1;
     int t_idx = 0;
-    int sock = 0;
 
     for (; t_idx < g_config->num_procs; ++t_idx) {
         struct worker* worker = &g_config->workers[t_idx];
@@ -343,7 +368,7 @@ run_client() {
             break;
         }
 
-        // add eventfd to epoll with level trigger
+        // Add eventfd to epoll with level trigger
         if (epoll_ctl(
                 worker->ep_fd,
                 EPOLL_CTL_ADD,
@@ -355,7 +380,7 @@ run_client() {
         
         atomic_store_explicit(&worker->running, 1, memory_order_release);
 
-        if (pthread_create(&worker->thread, NULL, client_worker, worker)) {
+        if (pthread_create(&worker->thread, NULL, io_loop, worker)) {
             perror("Failed to create thread");
             break;
         }
@@ -369,7 +394,7 @@ run_client() {
     sleep(g_config->duration_in_sec);
     notify_workers(test_end);
 
-    // wait for all threads to join
+    // Wait for all threads to join
     for (int i = 0; i < t_idx; ++i) {
         struct worker* worker = &g_config->workers[i];
 
@@ -378,7 +403,7 @@ run_client() {
         }
     }
 
-    // sum all results to the first worker
+    // Sum up all results into the first worker
     for (int i = 1; i < g_config->num_procs; ++i) {
         g_config->workers[0].connected_count += g_config->workers[i].connected_count;
         g_config->workers[0].failed_connect_count += g_config->workers[i].failed_connect_count;
@@ -581,10 +606,11 @@ main(
 
     *g_config = temp_config;
 
-    // proper initialization of the workers
+    // Proper initialization of the workers
     for (int i = 0; i < g_config->num_procs; ++i) {
         g_config->workers[i].ep_fd = -1;
         g_config->workers[i].event_fd = -1;
+        g_config->workers[i].listen_fd = -1;
     }
 
     if (g_config->role == role_server) {
