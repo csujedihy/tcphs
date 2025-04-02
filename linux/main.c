@@ -341,6 +341,10 @@ run_server() {
         if (g_config->workers[i].event_fd != -1) {
             close(g_config->workers[i].event_fd);
         }
+
+        if (g_config->workers[i].listen_fd != -1) {
+            close(g_config->workers[i].listen_fd);
+        }
     }
 
     return 0;
