@@ -182,7 +182,9 @@ io_loop(
     struct worker* worker = (struct worker*)arg;
     struct epoll_event events[MAX_EVENTS];
 
-    while (atomic_load_explicit(&worker->running, memory_order_acquire)) {
+    atomic_thread_fence(memory_order_acquire);
+
+    while (worker->running) {
         int nfds = epoll_wait(worker->ep_fd, events, MAX_EVENTS, -1);
         if (nfds == -1) {
             if (errno == EINTR) {
@@ -307,7 +309,8 @@ run_server() {
             break;
         }
 
-        atomic_store_explicit(&worker->running, 1, memory_order_release);
+        worker->running =  1;
+        atomic_thread_fence(memory_order_release);
 
         if (pthread_create(&worker->thread, NULL, io_loop, worker)) {
             perror("Failed to create thread");
@@ -364,7 +367,7 @@ run_client() {
 
         worker->event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
         if (worker->event_fd == -1) {
-            perror("Eventfd create failed");
+            perror("eventfd failed");
             break;
         }
 
@@ -374,11 +377,12 @@ run_client() {
                 EPOLL_CTL_ADD,
                 worker->event_fd,
                 &(struct epoll_event){.events = EPOLLIN, .data.fd = worker->event_fd}) == -1) {
-            perror("Epoll ctl failed");
+            perror("epoll_ctl for event_fd failed");
             break;
         }
         
-        atomic_store_explicit(&worker->running, 1, memory_order_release);
+        worker->running = 1;
+        atomic_thread_fence(memory_order_release);
 
         if (pthread_create(&worker->thread, NULL, io_loop, worker)) {
             perror("Failed to create thread");
