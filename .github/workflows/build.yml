@@ -59,12 +59,6 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y build-essential
         
-# Debug: Show Makefile contents
-    - name: Show Makefile
-      working-directory: ./linux
-      run: |
-        cat Makefile
-        
     # Build the project (clean first to force rebuild)
     - name: Build Linux
       working-directory: ./linux
@@ -72,9 +66,11 @@ jobs:
       run: |
         make clean || true  # Continue even if clean fails
         make all || make  # Try 'make all' first, fallback to 'make'
+
     # Upload build artifacts
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
+      working-directory: ./linux
       with:
         name: linux-build
         path: |
