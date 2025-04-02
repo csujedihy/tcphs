@@ -71,6 +71,8 @@ jobs:
       working-directory: ./linux
       shell: bash
       run: |
+        pwd
+        ls
         ls ./linux
 
     # Upload build artifacts
