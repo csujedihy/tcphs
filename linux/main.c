@@ -144,16 +144,6 @@ new_connect_io(
         goto done;
     }
 
-    err =
-        epoll_ctl(
-            worker->ep_fd,
-            EPOLL_CTL_ADD,
-            sock,
-            &(struct epoll_event){.events = EPOLLOUT | EPOLLONESHOT, .data.fd = sock});
-    if (err == -1) {
-        goto done;
-    }
-
     err = bind(sock, (struct sockaddr*)&g_config->local_addr, sizeof(g_config->local_addr));
     if (err == -1) {
         worker->failed_bind_count++;
@@ -163,6 +153,17 @@ new_connect_io(
     // Note: if connect succeeds inline, we will still get a EPOLLOUT event.
     err = connect(sock, (struct sockaddr*)&g_config->remote_addr, sizeof(g_config->remote_addr));
     if (err != 0 && errno != EINPROGRESS) {
+        goto done;
+    }
+
+    struct epoll_event event = {.events = EPOLLOUT | EPOLLONESHOT, .data.fd = sock};
+    err =
+        epoll_ctl(
+            worker->ep_fd,
+            EPOLL_CTL_ADD,
+            sock,
+            &event);
+    if (err == -1) {
         goto done;
     }
 
@@ -232,18 +233,22 @@ io_loop(
                     close(new_socket);
                 }
             } else {
-                // It's possible that we get a EPOLLERR event because
-                // the peer also closes forcibly right after the conn
-                // is established. The ERR and OUT events are not mutually
-                // exclusive and could be bundled up. So, we need to
-                // first check EPOLLOUT to count the successful connects 
-                // and treat EPOLLERR as a failure only when EPOLLOUT is
-                // not set.
+                // Error handling is tricky:
+                // EPOLLOUT does not neccessarily mean a connection was established.
+                // It means the socket is writable. A finished connect io that failed
+                // could also trigger EPOLLOUT.
+                // We need to check the socket error using getsockopt. If no error, we
+                // know a connection was established. If not, there is another case where
+                // the server can close the connection forcibly (by design) and the RST
+                // races with SO_ERROR. In this case, we need to see if the error is
+                // ECONNRESET. If it is, we also consider it a success.
                 if (event->events & EPOLLOUT) {
                     int error = 0;
                     socklen_t len = sizeof(error);
                     int ret = getsockopt(event->data.fd, SOL_SOCKET, SO_ERROR, &error, &len);
-                    if (ret != 0 || error != 0) {
+                    if (ret != 0) {
+                        perror("getsockopt (SO_ERROR) failed");
+                    } else if (error != 0 && error != ECONNRESET) {
                         worker->failed_connect_count++;
                     } else {
                         worker->connected_count++;
