@@ -73,7 +73,7 @@ jobs:
       with:
         name: linux-build
         path: |
-          linux/*  # This catches any executable files without extension
+          tcphs  # This catches any executable files without extension
 
     # Optional: Add cleanup step
     - name: Clean up
