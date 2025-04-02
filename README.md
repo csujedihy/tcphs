@@ -2,7 +2,7 @@ Build (win):
 msbuild tcphs.vcxproj /p:Configuration=Release /p:Platform=x64
 
 Build (linux):
-gcc -g -O3 main.c -o tcphs
+In linux folder, run `make`.
 
 Server:
 tcphs.exe -s -p 5555
