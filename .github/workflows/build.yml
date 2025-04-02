@@ -79,7 +79,7 @@ jobs:
       with:
         name: linux-build
         path: |
-          linux/
+          linux/tcphs
 
     # Optional: Add cleanup step
     - name: Clean up
