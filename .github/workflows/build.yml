@@ -67,10 +67,15 @@ jobs:
         make clean || true  # Continue even if clean fails
         make all || make  # Try 'make all' first, fallback to 'make'
 
+    - name: Build Linux
+      working-directory: ./linux
+      shell: bash
+      run: |
+        ls ./linux
+
     # Upload build artifacts
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
-      working-directory: ./linux
       with:
         name: linux-build
         path: |
