@@ -240,7 +240,14 @@ io_loop(
                 // and treat EPOLLERR as a failure only when EPOLLOUT is
                 // not set.
                 if (event->events & EPOLLOUT) {
-                    worker->connected_count++;
+                    int error = 0;
+                    socklen_t len = sizeof(error);
+                    int ret = getsockopt(event->data.fd, SOL_SOCKET, SO_ERROR, &error, &len);
+                    if (ret != 0 || error != 0) {
+                        worker->failed_connect_count++;
+                    } else {
+                        worker->connected_count++;
+                    }
                 } else if (event->events & EPOLLERR) {
                     worker->failed_connect_count++;
                 } else {
