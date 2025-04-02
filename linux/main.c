@@ -20,7 +20,6 @@
 
 #define USAGE "Usage: tcphs -s|-c <ip> [-p <port>] [-o <num conns>] [-a <num accepts>] [-t <duration in sec>] [-r <num procs>]\n"
 #define DEFAULT_NUM_CONNS 16
-#define DEFAULT_NUM_ACCEPTS 512
 #define DEFAULT_DURATION_IN_SEC 5
 #define HISTO_SIZE 512
 #define HISTO_GRANULARITY_US 100
@@ -58,7 +57,6 @@ struct global_config {
     struct sockaddr_storage local_addr;
     int num_procs;
     int num_conns;
-    int num_accepts;
     int duration_in_sec;
     pthread_t* threads;
     struct worker workers[0];
@@ -479,7 +477,6 @@ parse_cmd(
     
     config->num_procs = sysconf(_SC_NPROCESSORS_ONLN);
     config->num_conns = DEFAULT_NUM_CONNS;
-    config->num_accepts = DEFAULT_NUM_ACCEPTS;
     config->duration_in_sec = DEFAULT_DURATION_IN_SEC;
     config->local_addr.ss_family = AF_INET6;
     ((struct sockaddr_in6*)&config->local_addr)->sin6_addr = in6addr_any;
@@ -533,17 +530,6 @@ parse_cmd(
                 config->num_conns = atoi(argv[i]);
                 if (config->num_conns <= 0) {
                     printf("Invalid number of connections: %s\n", argv[i]);
-                    goto error;
-                }
-            } else {
-                goto error;
-            }
-        } else if (strcmp(argv[i], "-a") == 0) {
-            ++i;
-            if (i < argc) {
-                config->num_accepts = atoi(argv[i]);
-                if (config->num_accepts <= 0) {
-                    printf("Invalid number of accepts: %s\n", argv[i]);
                     goto error;
                 }
             } else {
