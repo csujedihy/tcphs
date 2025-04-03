@@ -237,11 +237,15 @@ io_loop(
                 // EPOLLOUT does not neccessarily mean a connection was established.
                 // It means the socket is writable. A finished connect io that failed
                 // could also trigger EPOLLOUT.
-                // We need to check the socket error using getsockopt. If no error, we
-                // know a connection was established. If not, there is another case where
-                // the server can close the connection forcibly (by design) and the RST
-                // races with SO_ERROR. In this case, we need to see if the error is
-                // ECONNRESET. If it is, we also consider it a success.
+                // We need to check the socket error using getsockopt (SO_ERROR).
+                // If no error, we know a connection was established.
+                // If not, there is another case where the server can close the
+                // connection forcibly (by design) and the RST races with SO_ERROR.
+                // In this case, we need to see if the error is ECONNRESET. If it is,
+                // we also consider it a success.
+                // We also need to place EPOLLOUT as the first check because an established
+                // and then aborted (by the peer) connection will trigger EPOLLERR and EPOLLOUT
+                // and these events could be indicated at the same time.
                 if (event->events & EPOLLOUT) {
                     int error = 0;
                     socklen_t len = sizeof(error);
