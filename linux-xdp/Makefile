@@ -50,6 +50,7 @@ clean:
 	rm -f $(USER_OBJ) $(XDP_OBJ) $(USER_BIN) $(XDP_LL)
 
 test: all
+	echo "testing...\n"
 	sudo ip link set dev $(TEST_IFACE) xdp off
 	sudo ./$(USER_BIN) -d $(TEST_IFACE)
 	sudo ip link set dev $(TEST_IFACE) xdp off

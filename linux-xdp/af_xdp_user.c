@@ -3,8 +3,13 @@
 #include <string.h>
 #include <errno.h>
 #include <getopt.h>
+#include <assert.h>
+#include <unistd.h>
+
+#include <sys/resource.h>
 
 #include <linux/bpf.h>
+#include <xdp/xsk.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/libxdp.h>
@@ -18,6 +23,29 @@ struct global_config {
     char ifname[IF_NAMESIZE];
 };
 
+struct umem_info {
+    struct xsk_ring_prod fq;
+    struct xsk_ring_cons cq;
+    struct xsk_umem* umem;
+    void* buffer;
+};
+
+#define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE;
+#define NUM_FRAMES 4096
+
+struct socket_info {
+    struct xsk_ring_cons rx;
+    struct xsk_ring_prod tx;
+    struct umem_info *umem;
+    struct xsk_socket *xsk;
+
+    uint64_t umem_frame_addr[NUM_FRAMES];
+    uint32_t umem_frame_free;
+
+    uint32_t outstanding_tx;
+};
+
+int xsk_map_fd;
 struct global_config config;
 
 int
@@ -58,7 +86,218 @@ parse_cmd(
     return 0;
 }
 
-int main(int argc, char **argv)
+static
+struct umem_info*
+umem_info_init()
+{
+    struct umem_info* info = NULL;
+    int err;
+
+    info = calloc(1, (sizeof(*info)));
+    if (!info) {
+        fprintf(stderr, "Failed to allocate memory for umem_info\n");
+        goto Failed;
+    }
+
+    struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
+        fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n", strerror(errno));
+        goto Failed;
+    }
+
+    uint64_t packet_buffer_size = NUM_FRAMES * FRAME_SIZE;
+    void *packet_buffer = NULL;
+    if (posix_memalign(&packet_buffer, getpagesize(), packet_buffer_size)) {
+        fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n", strerror(errno));
+        goto Failed;
+    }
+
+    err = xsk_umem__create(&info->umem, packet_buffer, packet_buffer_size, &info->fq, &info->cq, NULL);
+    if (err) {
+        fprintf(stderr, "xsk_umem__create failed %s\n", strerror(err));
+        goto Failed;
+    }
+
+    return info;
+
+Failed:
+
+    if (info) {
+        free(info);
+    }
+    return NULL;
+}
+
+static
+uint64_t
+alloc_umem_frame(
+    struct socket_info *xsk_info
+    )
+{
+    uint64_t frame;
+    if (xsk_info->umem_frame_free == 0)
+        return UINT64_MAX;
+
+    frame = xsk_info->umem_frame_addr[--xsk_info->umem_frame_free];
+    xsk_info->umem_frame_addr[xsk_info->umem_frame_free] = UINT64_MAX;
+    return frame;
+}
+
+static
+void
+free_umem_frame(
+    struct socket_info* xsk_info,
+    uint64_t frame
+    )
+{
+    assert(xsk_info->umem_frame_free < NUM_FRAMES);
+
+    xsk_info->umem_frame_addr[xsk_info->umem_frame_free++] = frame;
+}
+
+static
+uint64_t
+umem_avail_frames(
+    struct socket_info *xsk_info
+    )
+{
+    return xsk_info->umem_frame_free;
+}
+
+struct socket_info*
+socket_info_init(
+    struct umem_info *umem
+    )
+{
+    struct socket_info *info = NULL;
+    struct xsk_socket_config xsk_cfg = {0};
+    uint32_t idx;
+    int i;
+    int ret;
+
+    info = calloc(1, sizeof(*info));
+    if (!info) {
+        fprintf(stderr, "Failed to allocate memory for socket_info\n");
+        goto Failed;
+    }
+
+    info->umem = umem;
+    xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+    xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+    xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+    // bind to queue 0 for now
+    ret = xsk_socket__create(&info->xsk, config.ifname, 0, umem->umem, &info->rx, &info->tx, &xsk_cfg);
+    if (ret) {
+        fprintf(stderr, "xsk_socket__create failed %s\n", strerror(ret));
+        goto Failed;
+    }
+
+    ret = xsk_socket__update_xskmap(info->xsk, xsk_map_fd);
+    if (ret) {
+        fprintf(stderr, "xsk_socket__update_xskmap failed %s\n", strerror(ret));
+        goto Failed;
+    }
+
+    for (i = 0; i < NUM_FRAMES; ++i) {
+        info->umem_frame_addr[i] = i * FRAME_SIZE;
+    }
+    info->umem_frame_free = NUM_FRAMES;
+
+    ret = xsk_ring_prod__reserve(&info->tx, XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx);
+    if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS) {
+        fprintf(stderr, "xsk_ring_prod__reserve failed %s\n", strerror(ret));
+        goto Failed;
+    }
+
+    for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; ++i) {
+        *xsk_ring_prod__fill_addr(&info->umem->fq, idx++) = alloc_umem_frame(info);
+    }
+
+    xsk_ring_prod__submit(&info->umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS);
+
+    return info;
+
+Failed:
+    if (info) {
+        if (info->xsk >= 0) {
+            xsk_socket__delete(info->xsk);
+        }
+        free(info);
+    }
+    return NULL;
+}
+
+const int IO_BATCH_SIZE = 32;
+
+void
+do_rx(
+    struct socket_info* xsk_info,
+    uint8_t* pkt,
+    uint32_t len
+    )
+{
+    printf("pkt rcvd!!!\n");
+}
+
+static
+void
+rx_io(
+    struct socket_info* xsk_info
+    )
+{
+    unsigned int rcvd;
+    uint32_t idx_rx = 0;
+    uint32_t idx_fq = 0;
+
+    rcvd = xsk_ring_cons__peek(&xsk_info->rx, IO_BATCH_SIZE, &idx_rx);
+    if (rcvd == 0) {
+        return;
+    }
+
+    for (int i = 0; i < rcvd; ++i) {
+        const struct xdp_desc* desc = xsk_ring_cons__rx_desc(&xsk_info->rx, idx_rx++);
+        do_rx(
+            xsk_info,
+            xsk_umem__get_data(xsk_info->umem->buffer, desc->addr),
+            desc->len);
+        free_umem_frame(xsk_info, desc->addr);
+    }
+
+    xsk_ring_cons__release(&xsk_info->rx, rcvd);
+
+    unsigned int free_fill_frames =
+        xsk_prod_nb_free(
+            &xsk_info->umem->fq,
+            umem_avail_frames(xsk_info));
+
+    if (free_fill_frames > 0) {
+        unsigned int fill_rsvd =
+            xsk_ring_prod__reserve(&xsk_info->umem->fq, rcvd, &idx_fq);
+        for (int i = 0; i < fill_rsvd; ++i) {
+            *xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx_fq++) =
+                alloc_umem_frame(xsk_info);
+        }
+
+        xsk_ring_prod__submit(&xsk_info->umem->fq, free_fill_frames);
+    }
+}
+
+static
+void
+io_loop(
+    struct socket_info* xsk_info
+    )
+{
+    while (true) {
+        rx_io(xsk_info);
+    }
+}
+
+int
+main(
+    int argc,
+    char **argv
+    )
 {
     struct bpf_prog_info info = {};
     __u32 info_len = sizeof(info);
@@ -98,6 +337,10 @@ int main(int argc, char **argv)
         return err;
     }
 
+    printf("Success: Loading "
+           "XDP prog name:%s(id:%d) on device:%s(ifindex:%d)\n",
+           info.name, info.id, config.ifname, config.ifindex);
+
     /* This step is not really needed , BPF-info via bpf-syscall */
     prog_fd = xdp_program__fd(prog);
     err = bpf_obj_get_info_by_fd(prog_fd, &info, &info_len);
@@ -107,8 +350,45 @@ int main(int argc, char **argv)
         return err;
     }
 
-    printf("Success: Loading "
-           "XDP prog name:%s(id:%d) on device:%s(ifindex:%d)\n",
-           info.name, info.id, config.ifname, config.ifindex);
+    struct bpf_map *map;
+    map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
+    if (!map) {
+        fprintf(stderr, "ERR: can't find map xsks_map\n");
+        return -1;
+    }
+
+    xsk_map_fd = bpf_map__fd(map);
+    if (xsk_map_fd < 0) {
+        fprintf(stderr, "ERR: can't get map fd - %s\n", strerror(xsk_map_fd));
+        return -1;
+    }
+
+    struct umem_info* umem_info = umem_info_init();
+    if (!umem_info) {
+        fprintf(stderr, "ERR: can't create umem_info\n");
+        return -1;
+    }
+
+    struct socket_info* xsk_info = socket_info_init(umem_info);
+    if (!xsk_info) {
+        fprintf(stderr, "ERR: can't create socket_info\n");
+        return -1;
+    }
+
+    io_loop(xsk_info);
+
+    if (xsk_info) {
+        if (xsk_info->xsk) {
+            xsk_socket__delete(xsk_info->xsk);
+        }
+        free(xsk_info);
+    }
+    if (umem_info) {
+        if (umem_info->umem) {
+            xsk_umem__delete(umem_info->umem);
+        }
+        free(umem_info);
+    }
+
     return 0;
 }
