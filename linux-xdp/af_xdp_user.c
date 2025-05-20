@@ -42,7 +42,7 @@ struct socket_info {
     uint64_t umem_frame_addr[NUM_FRAMES];
     uint32_t umem_frame_free;
 
-    uint32_t outstanding_tx;
+    uint32_t conn_credit; // the # of outbound connections we are allowed to have
 };
 
 int xsk_map_fd;
@@ -284,11 +284,52 @@ rx_io(
 
 static
 void
+conn_out(
+    struct socket_info* xsk_info
+    )
+{
+    unsigned int completed;
+    uint32_t idx_cq;
+
+    completed =
+        xsk_ring_cons__peek(
+            &xsk_info->umem->cq,
+            XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
+    
+    if (completed > 0) {
+        for (int i = 0; i < completed; ++i) {
+            const struct xdp_desc* desc =
+                xsk_ring_cons__cq_desc(&xsk_info->umem->cq, idx_cq++);
+            free_umem_frame(xsk_info, desc->addr);
+        }
+        xsk_ring_cons__release(&xsk_info->umem->cq, completed);
+    }
+
+    if (xsk_info->conn_credit > 0) {
+        unsigned int tx_rsvd;
+        uint32_t idx_tx;
+
+        tx_rsvd = xsk_ring_prod__reserve(&xsk_info->tx, xsk_info->conn_credit, &idx_tx);
+        if (tx_rsvd > 0) {
+            for (int i = 0; i < tx_rsvd; ++i) {
+                struct xdp_desc* desc =
+                    xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx++);
+                desc->addr = alloc_umem_frame(xsk_info);
+                desc->len = FRAME_SIZE;
+            }
+            xsk_ring_prod__submit(&xsk_info->tx, tx_rsvd);
+        }
+    }
+}
+
+static
+void
 io_loop(
     struct socket_info* xsk_info
     )
 {
     while (true) {
+        conn_out(xsk_info);
         rx_io(xsk_info);
     }
 }
