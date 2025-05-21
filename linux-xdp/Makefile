@@ -14,7 +14,7 @@ XDP_CFLAGS = -D__BPF__ -O2 \
 LDFLAGS = -lbpf -lxdp
 
 # Test interface name
-TEST_IFACE = veth-adv03
+TEST_IFACE = lo
 
 # Source files
 USER_SRC = af_xdp_user.c
@@ -52,7 +52,7 @@ clean:
 test: all
 	echo "testing...\n"
 	sudo ip link set dev $(TEST_IFACE) xdp off
-	sudo ./$(USER_BIN) -d $(TEST_IFACE)
+	sudo ./$(USER_BIN) -d $(TEST_IFACE) -p 4433
 	sudo ip link set dev $(TEST_IFACE) xdp off
 
 # Phony targets

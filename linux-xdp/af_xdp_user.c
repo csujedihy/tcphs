@@ -1,4 +1,5 @@
-﻿#include <stdio.h>
+﻿#define _GNU_SOURCE
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -14,13 +15,21 @@
 #include <bpf/libbpf.h>
 #include <xdp/libxdp.h>
 
+
 #include <net/if.h>
+#include <arpa/inet.h>
+#include <linux/if_ether.h>
 #include <linux/if_link.h> /* depend on kernel-headers installed */
+#include <netinet/ip6.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
 
 struct global_config {
     int ifindex;
     int attach_mode;
     char ifname[IF_NAMESIZE];
+
+    uint16_t remote_port;
 };
 
 struct umem_info {
@@ -76,6 +85,14 @@ parse_cmd(
                 fprintf(stderr, "Missing interface name after -d\n");
                 return -1;
             }
+        }  else if (strcmp(argv[i], "-p") == 0) {
+            ++i;
+            if (i < argc) {
+                config->remote_port = atoi(argv[i]);
+            } else {
+                fprintf(stderr, "Missing remote port number after -p\n");
+                return -1;
+            }
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return -1;
@@ -118,6 +135,7 @@ umem_info_init()
         goto Failed;
     }
 
+    info->buffer = packet_buffer;
     return info;
 
 Failed:
@@ -203,7 +221,7 @@ socket_info_init(
     }
     info->umem_frame_free = NUM_FRAMES;
 
-    ret = xsk_ring_prod__reserve(&info->tx, XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx);
+    ret = xsk_ring_prod__reserve(&info->umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx);
     if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS) {
         fprintf(stderr, "xsk_ring_prod__reserve failed %s\n", strerror(ret));
         goto Failed;
@@ -236,7 +254,7 @@ do_rx(
     uint32_t len
     )
 {
-    printf("pkt rcvd!!!\n");
+    printf("pkt rcvd!!! len %u\n", len);
 }
 
 static
@@ -282,6 +300,108 @@ rx_io(
     }
 }
 
+const uint8_t dest_mac[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+uint16_t
+xsum16(
+    uint8_t* data,
+    uint32_t len,
+    uint64_t init
+    )
+{
+    //
+    // Add up all bytes in 3 steps:
+    // 1. Add the odd byte to the checksum if the length is odd.
+    // 2. If the length is divisible by 2 but not 4, add the last 2 bytes.
+    // 3. Sum up the rest as 32-bit words.
+    //
+    if ((len & 1) != 0) {
+        --len;
+        init += data[len];
+    }
+
+    if ((len & 2) != 0) {
+        len -= 2;
+        init += *((uint16_t*)(&data[len]));
+    }
+
+    for (uint32_t i = 0; i < len; i += 4) {
+        init += *((uint32_t*)(&data[i]));
+    }
+
+    // Fold all carries into the final checksum.
+    while (init >> 16) {
+        init = (init & 0xffff) + (init >> 16);
+    }
+
+    return (uint16_t)init;
+}
+
+uint16_t
+l4_xsum16(
+    uint8_t* saddr,
+    uint8_t* daddr,
+    uint32_t addrlen,
+    uint8_t proto,
+    uint16_t ip_payload_len,
+    uint8_t* data
+    )
+{
+    uint64_t xsum = htons(proto) + htons((uint16_t)ip_payload_len);
+    xsum = xsum16(saddr, addrlen, xsum);
+    xsum = xsum16(daddr, addrlen, xsum);
+    return ~xsum16(data, ip_payload_len, xsum);
+}
+
+static
+void
+frame_syn(
+    uint8_t* pkt,
+    uint32_t* len
+    )
+{
+    struct ethhdr* eth = (struct ethhdr*)pkt;
+    struct iphdr* ip = (struct iphdr*)(pkt + sizeof(struct ethhdr));
+    struct tcphdr* tcp = (struct tcphdr*)(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+
+    *len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
+
+    // eth header
+    memset(eth->h_dest, 0xFF, ETH_ALEN);
+    memset(eth->h_source, 0x00, ETH_ALEN);
+    eth->h_proto = htons(ETH_P_IP);
+
+    // ip header
+    ip->version = 4;
+    ip->id = 0;
+    ip->ihl = 5;
+    ip->ttl = 64;
+    ip->frag_off = 0;
+    ip->tos = 0;
+    ip->tot_len = htons(*len - sizeof(struct ethhdr));
+    ip->saddr = htonl(INADDR_LOOPBACK);
+    ip->daddr = htonl(INADDR_LOOPBACK);
+    ip->protocol = IPPROTO_TCP;
+    ip->check = xsum16((uint8_t*)ip, sizeof(*ip), 0);
+
+    // tcp header
+    tcp->th_sport = htons(1234);
+    tcp->th_dport = htons(config.remote_port);
+    tcp->th_win = 0xffff;
+    tcp->th_x2 = 0;
+    tcp->th_off = 5;
+    tcp->th_flags = TH_SYN;
+    tcp->th_seq = htonl(89648964);
+    tcp->th_ack = 0;
+    tcp->th_urp = 0;
+    tcp->th_sum =
+        l4_xsum16(
+            (uint8_t*)&ip->saddr, (uint8_t*)&ip->daddr,
+            sizeof(ip->saddr), ip->protocol,
+            ntohs(ip->tot_len) - sizeof(*ip),
+            (uint8_t*)tcp);
+}
+
 static
 void
 conn_out(
@@ -295,12 +415,10 @@ conn_out(
         xsk_ring_cons__peek(
             &xsk_info->umem->cq,
             XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
-    
     if (completed > 0) {
         for (int i = 0; i < completed; ++i) {
-            const struct xdp_desc* desc =
-                xsk_ring_cons__cq_desc(&xsk_info->umem->cq, idx_cq++);
-            free_umem_frame(xsk_info, desc->addr);
+            free_umem_frame(
+                xsk_info, *xsk_ring_cons__comp_addr(&xsk_info->umem->cq, idx_cq++));
         }
         xsk_ring_cons__release(&xsk_info->umem->cq, completed);
     }
@@ -312,13 +430,14 @@ conn_out(
         tx_rsvd = xsk_ring_prod__reserve(&xsk_info->tx, xsk_info->conn_credit, &idx_tx);
         if (tx_rsvd > 0) {
             for (int i = 0; i < tx_rsvd; ++i) {
-                struct xdp_desc* desc =
-                    xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx++);
+                struct xdp_desc* desc = xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx++);
                 desc->addr = alloc_umem_frame(xsk_info);
-                desc->len = FRAME_SIZE;
+                frame_syn(xsk_umem__get_data(xsk_info->umem->buffer, desc->addr), &desc->len);
             }
             xsk_ring_prod__submit(&xsk_info->tx, tx_rsvd);
+            xsk_info->conn_credit -= tx_rsvd;
         }
+        sendto(xsk_socket__fd(xsk_info->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
     }
 }
 
@@ -416,6 +535,7 @@ main(
         return -1;
     }
 
+    xsk_info->conn_credit = 4;
     io_loop(xsk_info);
 
     if (xsk_info) {
