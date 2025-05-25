@@ -6,6 +6,9 @@
 #include <getopt.h>
 #include <assert.h>
 #include <unistd.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include <sys/resource.h>
 
@@ -56,6 +59,15 @@ struct socket_info {
 
 int xsk_map_fd;
 struct global_config config;
+atomic_ushort src_port = 1025;
+
+uint16_t
+port_acquire_n(
+    void
+    )
+{
+    return htons(1 + atomic_fetch_add_explicit(&src_port, 1, memory_order_relaxed));
+}
 
 int
 parse_cmd(
@@ -254,7 +266,7 @@ do_rx(
     uint32_t len
     )
 {
-    printf("pkt rcvd!!! len %u\n", len);
+    
 }
 
 static
@@ -353,6 +365,11 @@ l4_xsum16(
     return ~xsum16(data, ip_payload_len, xsum);
 }
 
+static const unsigned char src_mac[6] = { 0x9e, 0xfe, 0x00, 0x24, 0x45, 0x5e };
+static const unsigned char dst_mac[6] = { 0x02, 0xac, 0x5d, 0xb6, 0xd8, 0x22 };
+static struct in_addr src_addr;
+static struct in_addr dst_addr;
+
 static
 void
 frame_syn(
@@ -367,8 +384,8 @@ frame_syn(
     *len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
 
     // eth header
-    memset(eth->h_dest, 0xFF, ETH_ALEN);
-    memset(eth->h_source, 0x00, ETH_ALEN);
+    memcpy(eth->h_dest, dst_mac, ETH_ALEN);
+    memcpy(eth->h_source, src_mac, ETH_ALEN);
     eth->h_proto = htons(ETH_P_IP);
 
     // ip header
@@ -379,19 +396,20 @@ frame_syn(
     ip->frag_off = 0;
     ip->tos = 0;
     ip->tot_len = htons(*len - sizeof(struct ethhdr));
-    ip->saddr = htonl(INADDR_LOOPBACK);
-    ip->daddr = htonl(INADDR_LOOPBACK);
+    ip->saddr = src_addr.s_addr;
+    ip->daddr = dst_addr.s_addr;
     ip->protocol = IPPROTO_TCP;
-    ip->check = xsum16((uint8_t*)ip, sizeof(*ip), 0);
+    ip->check = 0;
+    ip->check = ~xsum16((uint8_t*)ip, ip->ihl * 4, 0);
 
     // tcp header
-    tcp->th_sport = htons(1234);
+    tcp->th_sport = port_acquire_n();
     tcp->th_dport = htons(config.remote_port);
     tcp->th_win = 0xffff;
     tcp->th_x2 = 0;
     tcp->th_off = 5;
     tcp->th_flags = TH_SYN;
-    tcp->th_seq = htonl(89648964);
+    tcp->th_seq = htonl(rand());
     tcp->th_ack = 0;
     tcp->th_urp = 0;
     tcp->th_sum =
@@ -467,6 +485,8 @@ main(
     char errmsg[1024];
     int prog_fd, err; // = EXIT_SUCCESS;
 
+    srand(time(NULL));
+
     DECLARE_LIBBPF_OPTS(bpf_object_open_opts, bpf_opts);
     DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts,
                         .open_filename = filename,
@@ -476,6 +496,9 @@ main(
     if (parse_cmd(argc, argv, &config)) {
         return -1;
     }
+
+    inet_pton(AF_INET, "1.1.1.1", &src_addr);
+    inet_pton(AF_INET, "1.1.1.2", &dst_addr);
 
     /* Create an xdp_program froma a BPF ELF object file */
     prog = xdp_program__create(&xdp_opts);

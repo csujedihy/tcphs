@@ -14,7 +14,7 @@ XDP_CFLAGS = -D__BPF__ -O2 \
 LDFLAGS = -lbpf -lxdp
 
 # Test interface name
-TEST_IFACE = lo
+TEST_IFACE = veth0
 
 # Source files
 USER_SRC = af_xdp_user.c

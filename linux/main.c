@@ -528,6 +528,26 @@ parse_cmd(
                 printf(USAGE);
                 return -1;
             }
+        } else if (strcmp(argv[i], "-b") == 0) {
+            ++i;
+            if (i < argc && config->role == role_client) {
+                struct sockaddr_storage temp_sa = { 0 };
+                if (parse_ip_address(argv[i], &temp_sa) == -1) {
+                    printf("Invalid IP address: %s\n", argv[i]);
+                    return -1;
+                }
+                if (temp_sa.ss_family == AF_INET) {
+                    config->local_addr.ss_family = AF_INET6;
+                    in6addr_set_v4mapped(
+                        &((struct sockaddr_in6*)&config->local_addr)->sin6_addr,
+                        &((struct sockaddr_in*)&temp_sa)->sin_addr);
+                } else {
+                    config->local_addr = temp_sa;
+                }
+            } else {
+                printf(USAGE);
+                return -1;
+            }
         } else if (strcmp(argv[i], "-p") == 0) {
             ++i;
             if (i < argc) {
