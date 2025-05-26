@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <time.h>
 
 #include <sys/resource.h>
@@ -27,12 +28,16 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 
+#define WRITE_ONCE(var, val) (*(volatile typeof(var) *)&(var) = (val))
+
 struct global_config {
     int ifindex;
     int attach_mode;
     char ifname[IF_NAMESIZE];
 
     uint16_t remote_port;
+    atomic_bool running;
+    _Atomic(uint32_t) completed_conns; // the # of completed connections
 };
 
 struct umem_info {
@@ -55,18 +60,41 @@ struct socket_info {
     uint32_t umem_frame_free;
 
     uint32_t conn_credit; // the # of outbound connections we are allowed to have
+    uint32_t outstanding_tx;
+    atomic_ushort ip_id;
+    uint32_t tx_completed;
 };
 
 int xsk_map_fd;
 struct global_config config;
 atomic_ushort src_port = 1025;
 
+static
+uint16_t
+interlocked_inc16(
+    atomic_ushort* value
+    )
+{
+    return 1 + atomic_fetch_add_explicit(value, 1, memory_order_release);
+}
+
+static
+uint32_t
+interlocked_inc32(
+    _Atomic(uint32_t)* value
+    )
+{
+    return 1 + atomic_fetch_add_explicit(value, 1, memory_order_release);
+}
+
+inline
+static
 uint16_t
 port_acquire_n(
     void
     )
 {
-    return htons(1 + atomic_fetch_add_explicit(&src_port, 1, memory_order_relaxed));
+    return htons(interlocked_inc16(&src_port));
 }
 
 int
@@ -113,6 +141,59 @@ parse_cmd(
     }
 
     return 0;
+}
+
+static
+uint16_t
+xsum16(
+    uint8_t* data,
+    uint32_t len,
+    uint64_t init
+    )
+{
+    //
+    // Add up all bytes in 3 steps:
+    // 1. Add the odd byte to the checksum if the length is odd.
+    // 2. If the length is divisible by 2 but not 4, add the last 2 bytes.
+    // 3. Sum up the rest as 32-bit words.
+    //
+    if ((len & 1) != 0) {
+        --len;
+        init += data[len];
+    }
+
+    if ((len & 2) != 0) {
+        len -= 2;
+        init += *((uint16_t*)(&data[len]));
+    }
+
+    for (uint32_t i = 0; i < len; i += 4) {
+        init += *((uint32_t*)(&data[i]));
+    }
+
+    // Fold all carries into the final checksum.
+    while (init >> 16) {
+        init = (init & 0xffff) + (init >> 16);
+    }
+
+    return (uint16_t)init;
+}
+
+static
+uint16_t
+l4_xsum16(
+    uint8_t* saddr,
+    uint8_t* daddr,
+    uint32_t addrlen,
+    uint8_t proto,
+    uint16_t ip_payload_len,
+    uint8_t* data
+    )
+{
+    uint64_t xsum = htons(proto) + htons((uint16_t)ip_payload_len);
+    xsum = xsum16(saddr, addrlen, xsum);
+    xsum = xsum16(daddr, addrlen, xsum);
+    return ~xsum16(data, ip_payload_len, xsum);
 }
 
 static
@@ -194,6 +275,7 @@ umem_avail_frames(
     return xsk_info->umem_frame_free;
 }
 
+static
 struct socket_info*
 socket_info_init(
     struct umem_info *umem
@@ -215,6 +297,7 @@ socket_info_init(
     xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
     xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
     xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+    xsk_cfg.xdp_flags = XDP_FLAGS_SKB_MODE;
     // bind to queue 0 for now
     ret = xsk_socket__create(&info->xsk, config.ifname, 0, umem->umem, &info->rx, &info->tx, &xsk_cfg);
     if (ret) {
@@ -259,14 +342,59 @@ Failed:
 
 const int IO_BATCH_SIZE = 32;
 
-void
+bool
 do_rx(
     struct socket_info* xsk_info,
-    uint8_t* pkt,
+    uint64_t addr,
     uint32_t len
     )
 {
+    uint8_t* pkt = xsk_umem__get_data(xsk_info->umem->buffer, addr);
+	struct ethhdr *eth = (struct ethhdr*) pkt;
+	struct iphdr *ip = (struct iphdr*) (eth + 1);
+    struct tcphdr *tcp = (struct tcphdr*) (ip + 1);
+    uint8_t tmp_mac[ETH_ALEN];
+    int ret;
+    uint32_t tx_idx = 0;
+
+    // Swap source and destination MAC addresses
+    memcpy(tmp_mac, eth->h_source, ETH_ALEN);
+    memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+    memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
+
+    // Swap source and destination IP addresses
+    ip->daddr ^= ip->saddr;
+    ip->saddr ^= ip->daddr;
+    ip->daddr ^= ip->saddr;
+
+    // Swap source and destination ports
+    tcp->dest ^= tcp->source;
+    tcp->source ^= tcp->dest;
+    tcp->dest ^= tcp->source;
+
+    uint32_t seq = ntohl(tcp->seq);
+    tcp->seq = tcp->ack_seq;
+    tcp->ack_seq = htonl(seq + 1);
+    tcp->th_flags = TH_ACK;
+    tcp->th_sum = 0; // Reset checksum
+    tcp->th_sum =
+        l4_xsum16(
+            (uint8_t*)&ip->saddr, (uint8_t*)&ip->daddr,
+            sizeof(ip->saddr), ip->protocol,
+            ntohs(ip->tot_len) - sizeof(*ip),
+            (uint8_t*)tcp);
     
+    ret = xsk_ring_prod__reserve(&xsk_info->tx, 1, &tx_idx);
+    if (ret != 1)
+        return false;
+    struct xdp_desc* desc = xsk_ring_prod__tx_desc(&xsk_info->tx, tx_idx);
+    desc->addr = addr;
+    desc->len = len;
+    xsk_ring_prod__submit(&xsk_info->tx, 1);
+    ++xsk_info->conn_credit;
+    interlocked_inc32(&config.completed_conns);
+    ++xsk_info->outstanding_tx;
+    return true;
 }
 
 static
@@ -286,11 +414,9 @@ rx_io(
 
     for (int i = 0; i < rcvd; ++i) {
         const struct xdp_desc* desc = xsk_ring_cons__rx_desc(&xsk_info->rx, idx_rx++);
-        do_rx(
-            xsk_info,
-            xsk_umem__get_data(xsk_info->umem->buffer, desc->addr),
-            desc->len);
-        free_umem_frame(xsk_info, desc->addr);
+        if (!do_rx(xsk_info, desc->addr, desc->len)) {
+            free_umem_frame(xsk_info, desc->addr);
+        }
     }
 
     xsk_ring_cons__release(&xsk_info->rx, rcvd);
@@ -304,8 +430,8 @@ rx_io(
         unsigned int fill_rsvd =
             xsk_ring_prod__reserve(&xsk_info->umem->fq, rcvd, &idx_fq);
         for (int i = 0; i < fill_rsvd; ++i) {
-            *xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx_fq++) =
-                alloc_umem_frame(xsk_info);
+            uint64_t frame = alloc_umem_frame(xsk_info);
+            *xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx_fq++) = frame;
         }
 
         xsk_ring_prod__submit(&xsk_info->umem->fq, free_fill_frames);
@@ -313,58 +439,6 @@ rx_io(
 }
 
 const uint8_t dest_mac[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-uint16_t
-xsum16(
-    uint8_t* data,
-    uint32_t len,
-    uint64_t init
-    )
-{
-    //
-    // Add up all bytes in 3 steps:
-    // 1. Add the odd byte to the checksum if the length is odd.
-    // 2. If the length is divisible by 2 but not 4, add the last 2 bytes.
-    // 3. Sum up the rest as 32-bit words.
-    //
-    if ((len & 1) != 0) {
-        --len;
-        init += data[len];
-    }
-
-    if ((len & 2) != 0) {
-        len -= 2;
-        init += *((uint16_t*)(&data[len]));
-    }
-
-    for (uint32_t i = 0; i < len; i += 4) {
-        init += *((uint32_t*)(&data[i]));
-    }
-
-    // Fold all carries into the final checksum.
-    while (init >> 16) {
-        init = (init & 0xffff) + (init >> 16);
-    }
-
-    return (uint16_t)init;
-}
-
-uint16_t
-l4_xsum16(
-    uint8_t* saddr,
-    uint8_t* daddr,
-    uint32_t addrlen,
-    uint8_t proto,
-    uint16_t ip_payload_len,
-    uint8_t* data
-    )
-{
-    uint64_t xsum = htons(proto) + htons((uint16_t)ip_payload_len);
-    xsum = xsum16(saddr, addrlen, xsum);
-    xsum = xsum16(daddr, addrlen, xsum);
-    return ~xsum16(data, ip_payload_len, xsum);
-}
-
 static const unsigned char src_mac[6] = { 0x9e, 0xfe, 0x00, 0x24, 0x45, 0x5e };
 static const unsigned char dst_mac[6] = { 0x02, 0xac, 0x5d, 0xb6, 0xd8, 0x22 };
 static struct in_addr src_addr;
@@ -373,6 +447,7 @@ static struct in_addr dst_addr;
 static
 void
 frame_syn(
+    struct socket_info* xsk_info,
     uint8_t* pkt,
     uint32_t* len
     )
@@ -380,7 +455,6 @@ frame_syn(
     struct ethhdr* eth = (struct ethhdr*)pkt;
     struct iphdr* ip = (struct iphdr*)(pkt + sizeof(struct ethhdr));
     struct tcphdr* tcp = (struct tcphdr*)(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
-
     *len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
 
     // eth header
@@ -390,17 +464,17 @@ frame_syn(
 
     // ip header
     ip->version = 4;
-    ip->id = 0;
+    ip->id = htons(atomic_fetch_add(&xsk_info->ip_id, 1));
     ip->ihl = 5;
     ip->ttl = 64;
-    ip->frag_off = 0;
+    ip->frag_off = 0;    
     ip->tos = 0;
     ip->tot_len = htons(*len - sizeof(struct ethhdr));
     ip->saddr = src_addr.s_addr;
     ip->daddr = dst_addr.s_addr;
     ip->protocol = IPPROTO_TCP;
-    ip->check = 0;
-    ip->check = ~xsum16((uint8_t*)ip, ip->ihl * 4, 0);
+    WRITE_ONCE(ip->check, 0); // Reset checksum
+    ip->check = ~xsum16((uint8_t*)ip, sizeof(*ip), 0);
 
     // tcp header
     tcp->th_sport = port_acquire_n();
@@ -412,6 +486,7 @@ frame_syn(
     tcp->th_seq = htonl(rand());
     tcp->th_ack = 0;
     tcp->th_urp = 0;
+    tcp->th_sum = 0;
     tcp->th_sum =
         l4_xsum16(
             (uint8_t*)&ip->saddr, (uint8_t*)&ip->daddr,
@@ -426,21 +501,6 @@ conn_out(
     struct socket_info* xsk_info
     )
 {
-    unsigned int completed;
-    uint32_t idx_cq;
-
-    completed =
-        xsk_ring_cons__peek(
-            &xsk_info->umem->cq,
-            XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
-    if (completed > 0) {
-        for (int i = 0; i < completed; ++i) {
-            free_umem_frame(
-                xsk_info, *xsk_ring_cons__comp_addr(&xsk_info->umem->cq, idx_cq++));
-        }
-        xsk_ring_cons__release(&xsk_info->umem->cq, completed);
-    }
-
     if (xsk_info->conn_credit > 0) {
         unsigned int tx_rsvd;
         uint32_t idx_tx;
@@ -450,12 +510,44 @@ conn_out(
             for (int i = 0; i < tx_rsvd; ++i) {
                 struct xdp_desc* desc = xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx++);
                 desc->addr = alloc_umem_frame(xsk_info);
-                frame_syn(xsk_umem__get_data(xsk_info->umem->buffer, desc->addr), &desc->len);
+                frame_syn(xsk_info, xsk_umem__get_data(xsk_info->umem->buffer, desc->addr), &desc->len);
             }
             xsk_ring_prod__submit(&xsk_info->tx, tx_rsvd);
             xsk_info->conn_credit -= tx_rsvd;
+            xsk_info->outstanding_tx += tx_rsvd;
         }
-        sendto(xsk_socket__fd(xsk_info->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+    }
+}
+
+static
+void
+complete_tx(
+    struct socket_info* xsk_info
+    )
+{
+    unsigned int completed;
+    uint32_t idx_cq;
+
+    if (!xsk_info->outstanding_tx) {
+        return;
+    }
+
+    sendto(xsk_socket__fd(xsk_info->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+
+    completed =
+        xsk_ring_cons__peek(
+            &xsk_info->umem->cq,
+            XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
+    if (completed > 0) {
+        for (int i = 0; i < completed; ++i) {
+            uint64_t addr = *xsk_ring_cons__comp_addr(&xsk_info->umem->cq, idx_cq++);
+            free_umem_frame(xsk_info, addr);
+        }
+        xsk_ring_cons__release(&xsk_info->umem->cq, completed);
+        xsk_info->outstanding_tx -=
+            completed < xsk_info->outstanding_tx ?
+                completed : xsk_info->outstanding_tx;
+        xsk_info->tx_completed += completed;
     }
 }
 
@@ -465,10 +557,21 @@ io_loop(
     struct socket_info* xsk_info
     )
 {
-    while (true) {
+    while (atomic_load(&config.running)) {
         conn_out(xsk_info);
         rx_io(xsk_info);
+        complete_tx(xsk_info);
     }
+}
+
+static
+void
+exit_application(
+    int signum
+    )
+{
+    atomic_store(&config.running, 0);
+    printf("Completed conns: %u\n", config.completed_conns);
 }
 
 int
@@ -484,6 +587,8 @@ main(
     struct xdp_program *prog;
     char errmsg[1024];
     int prog_fd, err; // = EXIT_SUCCESS;
+
+	signal(SIGINT, exit_application);
 
     srand(time(NULL));
 
@@ -558,7 +663,8 @@ main(
         return -1;
     }
 
-    xsk_info->conn_credit = 4;
+    config.running = true;
+    xsk_info->conn_credit = 1;
     io_loop(xsk_info);
 
     if (xsk_info) {

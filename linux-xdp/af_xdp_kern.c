@@ -24,20 +24,21 @@ int xdp_prog_simple(struct xdp_md *ctx)
     if (eth + 1 > data_end)
         return XDP_PASS;
 
-    if (eth->h_proto != bpf_htons(ETH_P_IP) && eth->h_proto != bpf_htons(ETH_P_IPV6)) {
+    if (eth->h_proto != bpf_htons(ETH_P_IP) && eth->h_proto != bpf_htons(ETH_P_IPV6))
         return XDP_PASS;
-    }
 
     struct iphdr *ip = data + sizeof(struct ethhdr);
     if (ip + 1 > data_end)
         return XDP_PASS;
 
-    if (ip->protocol != IPPROTO_TCP || ip->ihl != 5) {
+    if (ip->protocol != IPPROTO_TCP || ip->ihl != 5)
         return XDP_PASS;
-    }
 
     struct tcphdr *tcp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
     if (tcp + 1 > data_end)
+        return XDP_PASS;
+
+    if (!tcp->syn || !tcp->ack)
         return XDP_PASS;
 
     int index = ctx->rx_queue_index;
