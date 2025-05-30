@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include <sys/resource.h>
 
@@ -38,6 +39,7 @@ struct global_config {
     uint16_t remote_port;
     atomic_bool running;
     _Atomic(uint32_t) completed_conns; // the # of completed connections
+    struct timeval start_time;
 };
 
 struct umem_info {
@@ -571,7 +573,15 @@ exit_application(
     )
 {
     atomic_store(&config.running, 0);
-    printf("Completed conns: %u\n", config.completed_conns);
+    struct timeval end_time;
+    gettimeofday(&end_time, NULL);
+    uint64_t elapsed_time = (end_time.tv_sec - config.start_time.tv_sec) * 1000000 +
+                        (end_time.tv_usec - config.start_time.tv_usec);
+    // caculate the conns completed per second
+    uint64_t conns_per_sec = ((uint64_t)config.completed_conns * 1000000) / elapsed_time;
+    printf("Connections per second: %lu\n", conns_per_sec);
+    printf("Total connections completed: %d\n", config.completed_conns);
+    printf("Total time elapsed: %ld microseconds\n", elapsed_time);
 }
 
 int
@@ -588,6 +598,7 @@ main(
     char errmsg[1024];
     int prog_fd, err; // = EXIT_SUCCESS;
 
+    gettimeofday(&config.start_time, NULL);
 	signal(SIGINT, exit_application);
 
     srand(time(NULL));
@@ -615,7 +626,6 @@ main(
         return err;
     }
 
-    /* Attach the xdp_program to the net device XDP hook */
     err = xdp_program__attach(prog, config.ifindex, config.attach_mode, 0);
     if (err) {
         libxdp_strerror(err, errmsg, sizeof(errmsg));
@@ -664,7 +674,7 @@ main(
     }
 
     config.running = true;
-    xsk_info->conn_credit = 1;
+    xsk_info->conn_credit = 32;
     io_loop(xsk_info);
 
     if (xsk_info) {
